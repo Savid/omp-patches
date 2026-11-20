@@ -1,0 +1,249 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Davis <1709934+Savid@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:28:18 +1000
+Subject: [PATCH] feat(ai): drain accounts whose saved reset is about to lapse
+
+The account picker ranks siblings by required drain: the share of a window
+left unused divided by the hours until it resets, so quota about to go to
+waste is used first. A saved reset (Claude, Codex) that expires before the
+window it clears resets on its own is lost unless spent in this window, and
+it gives back what the window has used when it is spent: worth the most
+with the window full.
+
+So when an account holds a usable saved reset that lapses before a window
+resets, the reset's expiry, not the window's reset, is that window's
+deadline. The account's drain rises and the gateway sends it work first,
+filling the window by the time the reset is spent (see the salvage sweep).
+A reset that names the limits it clears counts only for those; one that
+names none counts for every window; one the provider says cannot be spent
+never counts.
+
+Upstream-Status: Pending
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ packages/ai/src/auth/select.ts                | 33 ++++++-
+ packages/ai/src/auth/usage-report.ts          | 40 ++++++++-
+ .../ai/test/auth-lapsing-reset-drain.test.ts  | 87 +++++++++++++++++++
+ 3 files changed, 155 insertions(+), 5 deletions(-)
+ create mode 100644 packages/ai/test/auth-lapsing-reset-drain.test.ts
+
+diff --git a/packages/ai/src/auth/select.ts b/packages/ai/src/auth/select.ts
+index cc913d1c5c..a931bcc30f 100644
+--- a/packages/ai/src/auth/select.ts
++++ b/packages/ai/src/auth/select.ts
+@@ -41,6 +41,7 @@ import {
+ import type { UsageService } from "./usage";
+ import {
+ 	isUsageLimitReached,
++	lapsingResetDeadline,
+ 	normalizeUsageFraction,
+ 	remainingUsageFraction,
+ 	scopedUsageLimits,
+@@ -297,9 +298,19 @@ export class CredentialSelector {
+ 				hasPriorityBoost: strategy.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
+ 				planPriority: 0,
+ 				secondaryUsed: normalizeUsageFraction(secondary),
+-				secondaryRequiredDrain: windowRequiredDrain(secondary, nowMs, strategy.windowDefaults.secondaryMs),
++				secondaryRequiredDrain: windowRequiredDrain(
++					secondary,
++					nowMs,
++					strategy.windowDefaults.secondaryMs,
++					lapsingResetDeadline(usage, secondary, nowMs),
++				),
+ 				primaryUsed: normalizeUsageFraction(primary),
+-				primaryRequiredDrain: windowRequiredDrain(primary, nowMs, strategy.windowDefaults.primaryMs),
++				primaryRequiredDrain: windowRequiredDrain(
++					primary,
++					nowMs,
++					strategy.windowDefaults.primaryMs,
++					lapsingResetDeadline(usage, primary, nowMs),
++				),
+ 				orderPos,
+ 			});
+ 		}
+@@ -555,10 +566,24 @@ export class CredentialSelector {
+ 				planPriority: planPriority(args.planGate, usage),
+ 				secondaryUsed: strategy ? normalizeUsageFraction(secondary) : 0,
+ 				secondaryRequiredDrain:
+-					strategy === undefined ? 0 : windowRequiredDrain(secondary, nowMs, strategy.windowDefaults.secondaryMs),
++					strategy === undefined
++						? 0
++						: windowRequiredDrain(
++								secondary,
++								nowMs,
++								strategy.windowDefaults.secondaryMs,
++								lapsingResetDeadline(usage, secondary, nowMs),
++							),
+ 				primaryUsed: strategy ? normalizeUsageFraction(primary) : 0,
+ 				primaryRequiredDrain:
+-					strategy === undefined ? 0 : windowRequiredDrain(primary, nowMs, strategy.windowDefaults.primaryMs),
++					strategy === undefined
++						? 0
++						: windowRequiredDrain(
++								primary,
++								nowMs,
++								strategy.windowDefaults.primaryMs,
++								lapsingResetDeadline(usage, primary, nowMs),
++							),
+ 				orderPos,
+ 			});
+ 		}
+diff --git a/packages/ai/src/auth/usage-report.ts b/packages/ai/src/auth/usage-report.ts
+index 564e5e1501..31d809091b 100644
+--- a/packages/ai/src/auth/usage-report.ts
++++ b/packages/ai/src/auth/usage-report.ts
+@@ -259,6 +259,34 @@ export function remainingUsageFraction(
+ 	return usedFractions.length === 0 ? undefined : Math.max(0, 1 - Math.max(...usedFractions));
+ }
+ 
++/**
++ * When a saved reset that would give `limit` back expires unspent before the
++ * window resets on its own. The reset is worth the most spent with the window
++ * full, so the window's headroom is due by the reset's expiry rather than by
++ * the window's reset. A reset that names the limits it clears counts only for
++ * those; one that names none counts for every window. A reset the provider
++ * says cannot be spent never counts. Undefined when no reset lapses first.
++ */
++export function lapsingResetDeadline(
++	report: UsageReport | null | undefined,
++	limit: UsageLimit | undefined,
++	nowMs: number,
++): number | undefined {
++	const credits = report?.resetCredits?.credits;
++	if (!credits || !limit) return undefined;
++	const resetAt = windowResetAt(limit.window);
++	let deadline: number | undefined;
++	for (const credit of credits) {
++		if (credit.usable === false || !credit.expiresAt) continue;
++		if (credit.clears && credit.clears.length > 0 && !credit.clears.includes(limit.id)) continue;
++		const expiresAt = Date.parse(credit.expiresAt);
++		if (!Number.isFinite(expiresAt) || expiresAt <= nowMs) continue;
++		if (resetAt !== undefined && expiresAt >= resetAt) continue;
++		deadline = deadline === undefined ? expiresAt : Math.min(deadline, expiresAt);
++	}
++	return deadline;
++}
++
+ /**
+  * Computes the required drain rate: `headroomFraction / remainingHours` —
+  * how fast the window's remaining quota must be consumed to fully use it
+@@ -266,8 +294,15 @@ export function remainingUsageFraction(
+  * unused = ranked first, so selection chases quota that is about to be
+  * wasted ("use it or lose it"). Without a reset clock, the full window
+  * duration is assumed to remain so clocked and clockless scores stay comparable.
++ * An earlier `deadlineMs` (see {@link lapsingResetDeadline}) shortens the time
++ * left, so an account whose saved reset is about to lapse is drained first.
+  */
+-export function windowRequiredDrain(limit: UsageLimit | undefined, nowMs: number, fallbackDurationMs: number): number {
++export function windowRequiredDrain(
++	limit: UsageLimit | undefined,
++	nowMs: number,
++	fallbackDurationMs: number,
++	deadlineMs?: number,
++): number {
+ 	const headroom = 1 - normalizeUsageFraction(limit);
+ 	if (headroom <= 0) return 0;
+ 	const resetAt = windowResetAt(limit?.window);
+@@ -276,6 +311,9 @@ export function windowRequiredDrain(limit: UsageLimit | undefined, nowMs: number
+ 	if (Number.isFinite(durationMs) && durationMs > 0) {
+ 		remainingMs = Math.min(remainingMs, durationMs);
+ 	}
++	if (deadlineMs !== undefined && Number.isFinite(deadlineMs)) {
++		remainingMs = Math.min(remainingMs, deadlineMs - nowMs);
++	}
+ 	// Floor at one minute: a stale report whose reset already passed must
+ 	// not produce an unbounded urgency score.
+ 	const remainingHours = Math.max(remainingMs, 60_000) / (60 * 60 * 1000);
+diff --git a/packages/ai/test/auth-lapsing-reset-drain.test.ts b/packages/ai/test/auth-lapsing-reset-drain.test.ts
+new file mode 100644
+index 0000000000..a2a6fbefe1
+--- /dev/null
++++ b/packages/ai/test/auth-lapsing-reset-drain.test.ts
+@@ -0,0 +1,87 @@
++import { describe, expect, test } from "bun:test";
++import { lapsingResetDeadline, windowRequiredDrain } from "../src/auth/usage-report";
++import type { UsageLimit, UsageReport, UsageResetCreditDetail } from "../src/usage";
++
++const HOUR = 3_600_000;
++const DAY = 24 * HOUR;
++const NOW = Date.UTC(2026, 10, 20, 0, 0, 0);
++
++function weekly(usedFraction: number, resetsInMs: number): UsageLimit {
++	return {
++		id: "anthropic:7d",
++		label: "Claude 7 Day",
++		scope: { provider: "anthropic" },
++		window: { id: "7d", label: "7 Day", durationMs: 7 * DAY, resetsAt: NOW + resetsInMs },
++		amount: { usedFraction, unit: "percent" },
++	} as UsageLimit;
++}
++
++function report(limit: UsageLimit, credits: UsageResetCreditDetail[]): UsageReport {
++	return {
++		provider: "anthropic",
++		fetchedAt: NOW,
++		limits: [limit],
++		resetCredits: { availableCount: credits.length, credits },
++	} as UsageReport;
++}
++
++const expiringIn = (ms: number, more: Partial<UsageResetCreditDetail> = {}): UsageResetCreditDetail => ({
++	usable: true,
++	clears: ["anthropic:7d"],
++	expiresAt: new Date(NOW + ms).toISOString(),
++	...more,
++});
++
++describe("lapsingResetDeadline", () => {
++	test("is a usable reset's expiry when it comes before the window resets", () => {
++		const limit = weekly(0.4, 5 * DAY);
++		expect(lapsingResetDeadline(report(limit, [expiringIn(2 * DAY)]), limit, NOW)).toBe(NOW + 2 * DAY);
++		// The soonest of several.
++		expect(lapsingResetDeadline(report(limit, [expiringIn(3 * DAY), expiringIn(DAY)]), limit, NOW)).toBe(NOW + DAY);
++	});
++
++	test("ignores resets that outlive the window, cannot be spent, have expired or clear other limits", () => {
++		const limit = weekly(0.4, 5 * DAY);
++		expect(lapsingResetDeadline(report(limit, [expiringIn(6 * DAY)]), limit, NOW)).toBeUndefined();
++		expect(lapsingResetDeadline(report(limit, [expiringIn(DAY, { usable: false })]), limit, NOW)).toBeUndefined();
++		expect(lapsingResetDeadline(report(limit, [expiringIn(-HOUR)]), limit, NOW)).toBeUndefined();
++		expect(
++			lapsingResetDeadline(report(limit, [expiringIn(DAY, { clears: ["anthropic:5h"] })]), limit, NOW),
++		).toBeUndefined();
++		expect(
++			lapsingResetDeadline(report(limit, [expiringIn(DAY, { expiresAt: undefined })]), limit, NOW),
++		).toBeUndefined();
++	});
++
++	test("counts a reset that names no limits for every window, and one whose usability is unknown", () => {
++		const limit = weekly(0.4, 5 * DAY);
++		expect(
++			lapsingResetDeadline(report(limit, [expiringIn(DAY, { clears: [], usable: undefined })]), limit, NOW),
++		).toBe(NOW + DAY);
++	});
++
++	test("has nothing to say without a report, credits or limit", () => {
++		const limit = weekly(0.4, 5 * DAY);
++		expect(lapsingResetDeadline(null, limit, NOW)).toBeUndefined();
++		expect(lapsingResetDeadline({ ...report(limit, []), resetCredits: undefined }, limit, NOW)).toBeUndefined();
++		expect(lapsingResetDeadline(report(limit, [expiringIn(DAY)]), undefined, NOW)).toBeUndefined();
++	});
++});
++
++describe("windowRequiredDrain with a lapsing reset", () => {
++	test("an earlier deadline raises the drain, so the account ranks first", () => {
++		const limit = weekly(0.4, 5 * DAY);
++		const natural = windowRequiredDrain(limit, NOW, 7 * DAY);
++		const lapsing = windowRequiredDrain(limit, NOW, 7 * DAY, NOW + DAY);
++		expect(natural).toBeCloseTo(0.6 / 120);
++		expect(lapsing).toBeCloseTo(0.6 / 24);
++		// A sibling with more headroom but no lapsing reset now ranks behind it.
++		expect(lapsing).toBeGreaterThan(windowRequiredDrain(weekly(0, 5 * DAY), NOW, 7 * DAY));
++	});
++
++	test("a later deadline changes nothing, and a full window still needs no drain", () => {
++		const limit = weekly(0.4, 5 * DAY);
++		expect(windowRequiredDrain(limit, NOW, 7 * DAY, NOW + 6 * DAY)).toBe(windowRequiredDrain(limit, NOW, 7 * DAY));
++		expect(windowRequiredDrain(weekly(1, 5 * DAY), NOW, 7 * DAY, NOW + DAY)).toBe(0);
++	});
++});

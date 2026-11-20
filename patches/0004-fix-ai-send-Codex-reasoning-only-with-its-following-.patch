@@ -1,0 +1,654 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Davis <1709934+Savid@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 01:04:06 -0700
+Subject: [PATCH] fix(ai): send Codex reasoning only with its following item;
+ retry refused reasoning
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Codex fails a request whose replayed reasoning item lacks the output item
+it led to ("…without its required following item"), and the backend can
+refuse encrypted_content minted for another account, which a session hits
+after a usage-limit or auth failover. Since Codex strips every input item
+id with store=false, the following-item rule can only hold positionally.
+
+- The Codex encoder drops each reasoning item that no output item of its
+  own turn follows: a Claude Code turn left with only thinking, a Codex
+  turn whose call never reached the client, or a cut turn.
+- The Responses route puts assistant message items into the open assistant
+  turn, with their id and phase, so one response's reasoning, messages and
+  calls stay one turn.
+- When Codex rejects replayed reasoning (invalid_encrypted_content or the
+  missing-following-item error), at transport open or in the stream, the
+  request is replayed once without any reasoning. The refused items are
+  remembered in the session's provider state, so later requests leave them
+  out while reasoning minted afterwards still replays.
+
+Tests cover each reviewed case through the real parseRequest paths and the
+final Codex request body, and both retry paths against a mocked backend.
+
+Upstream-Status: Pending
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ packages/ai/src/provider-session-state.ts     |   2 +
+ .../src/providers/openai-codex-responses.ts   |  66 ++++-
+ .../ai/src/providers/openai-codex-state.ts    |   6 +-
+ .../openai-codex/replayed-reasoning.ts        |  73 +++++
+ .../src/providers/openai-responses-server.ts  |  20 +-
+ packages/ai/src/providers/openai-shared.ts    |  23 ++
+ ...uth-gateway-codex-reasoning-replay.test.ts | 271 +++++++++++++++++-
+ 7 files changed, 433 insertions(+), 28 deletions(-)
+ create mode 100644 packages/ai/src/providers/openai-codex/replayed-reasoning.ts
+
+diff --git a/packages/ai/src/provider-session-state.ts b/packages/ai/src/provider-session-state.ts
+index 08a7beaecc..f11fd2cc25 100644
+--- a/packages/ai/src/provider-session-state.ts
++++ b/packages/ai/src/provider-session-state.ts
+@@ -32,6 +32,8 @@
+  *   bearer (`getCodexWebSocketSessionKey`), so a switch naturally lands on a
+  *   fresh transport session while the old one stays reachable for teardown.
+  *   Resetting from the outside would close a socket a retry may still be on.
++ *   `rejectedReasoning` is replayed reasoning some account refused; it stays,
++ *   since sending it again risks another failed request.
+  * - **Antigravity** — `lastGoodEndpoint` is endpoint-scoped; the agent /
+  *   conversation ids are conversation-scoped. Neither depends on the account.
+  * - **GitLab Duo** — the active workflow is account-bound, but it is a live
+diff --git a/packages/ai/src/providers/openai-codex-responses.ts b/packages/ai/src/providers/openai-codex-responses.ts
+index c2ac0ce2b1..04c44fd741 100644
+--- a/packages/ai/src/providers/openai-codex-responses.ts
++++ b/packages/ai/src/providers/openai-codex-responses.ts
+@@ -98,6 +98,11 @@ import {
+ 	planSteeredRequest,
+ 	toSteerInputItems,
+ } from "./openai-codex/live-steering";
++import {
++	dropRejectedCodexReasoning,
++	dropRememberedRejectedCodexReasoning,
++	type RejectedCodexReasoning,
++} from "./openai-codex/replayed-reasoning";
+ import { CodexApiError } from "./openai-codex/response-handler";
+ import { getCodexAttestationHeader } from "./openai-codex-attestation";
+ export { createOpenAICodexCompactionRequestContext } from "./openai-codex-compaction";
+@@ -142,6 +147,7 @@ import {
+ 	convertResponsesAssistantMessage,
+ 	convertResponsesInputContent,
+ 	createSequentialCutoffSummaryState,
++	dropUnfollowedResponsesReasoning,
+ 	encodeResponsesToolCallId,
+ 	encodeTextSignatureV1,
+ 	escapeReplayedControlTokens,
+@@ -452,6 +458,8 @@ export interface CodexProviderSessionState extends ProviderSessionState {
+ 	metadataSessions: Map<string, CodexMetadataSessionState>;
+ 	/** `configuration_update` effort baselines, keyed by model + session. */
+ 	effortControls: Map<string, OpenAIEffortControlState<ReasoningConfig["effort"]>>;
++	/** Replayed reasoning the backend rejected for this session; later requests leave it out. */
++	rejectedReasoning: RejectedCodexReasoning;
+ }
+ 
+ /** Request classification encoded in Codex turn metadata. */
+@@ -1279,6 +1287,7 @@ function createCodexRequestContext(
+ 	};
+ 
+ 	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
++	dropRememberedRejectedCodexReasoning(transformedBody, providerSessionState?.rejectedReasoning);
+ 	const isolatedTransportState =
+ 		contextOptions.isolateCompactionTransport && options?.codexCompaction
+ 			? createCodexProviderSessionState()
+@@ -1523,11 +1532,25 @@ async function openInitialCodexEventStream(
+ 	} else if (websocketState) {
+ 		releaseIdleCodexWebSocket(websocketState);
+ 	}
+-	try {
+-		return await openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
+-	} catch (error) {
+-		if (!dropRejectedCodexAccessPrograms(transformedBody, model, requestContext.accountId, error)) throw error;
+-		return openCodexSseTransport(model, requestContext, requestSetup, options, websocketState, transformedBody);
++	while (true) {
++		try {
++			return await openCodexSseTransport(
++				model,
++				requestContext,
++				requestSetup,
++				options,
++				websocketState,
++				transformedBody,
++			);
++		} catch (error) {
++			// Each drop removes what the backend rejected, so neither replays twice.
++			if (
++				!dropRejectedCodexAccessPrograms(transformedBody, model, requestContext.accountId, error) &&
++				!dropRejectedCodexReasoning(transformedBody, error, requestContext.providerSessionState?.rejectedReasoning)
++			) {
++				throw error;
++			}
++		}
+ 	}
+ }
+ 
+@@ -2699,6 +2722,9 @@ class CodexStreamProcessor {
+ 		if (await this.#tryDropRejectedAccessPrograms(error)) {
+ 			return true;
+ 		}
++		if (await this.#tryDropRejectedReasoning(error)) {
++			return true;
++		}
+ 		if (await this.#tryRecoverWhitespaceToolCallLoop(error)) {
+ 			return true;
+ 		}
+@@ -2877,6 +2903,33 @@ class CodexStreamProcessor {
+ 		) {
+ 			return false;
+ 		}
++		await this.#replayRejectedRequest();
++		return true;
++	}
++
++	/**
++	 * Replay the request without the reasoning the backend rejected (see
++	 * `openai-codex/replayed-reasoning.ts`). The rejection arrives before any
++	 * output, so the replay is always safe.
++	 */
++	async #tryDropRejectedReasoning(error: unknown): Promise<boolean> {
++		if (
++			hasVisibleAssistantContent(this.output) ||
++			this.options?.signal?.aborted ||
++			!dropRejectedCodexReasoning(
++				this.requestContext.transformedBody,
++				error,
++				this.requestContext.providerSessionState?.rejectedReasoning,
++			)
++		) {
++			return false;
++		}
++		await this.#replayRejectedRequest();
++		return true;
++	}
++
++	/** Send the (amended) request again from scratch on the transport in use. */
++	async #replayRejectedRequest(): Promise<void> {
+ 		this.#closeOpenBlocksForReplay();
+ 		const websocketState = this.requestContext.websocketState;
+ 		if (websocketState) resetCodexWebSocketAppendState(websocketState);
+@@ -2889,7 +2942,6 @@ class CodexStreamProcessor {
+ 		} else {
+ 			await this.#reopenSseStream(websocketState);
+ 		}
+-		return true;
+ 	}
+ 
+ 	/**
+@@ -4467,7 +4519,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
+ 		msgIndex += 1;
+ 	}
+ 
+-	return messages;
++	return dropUnfollowedResponsesReasoning(messages);
+ }
+ 
+ function normalizeInputMessageContent(
+diff --git a/packages/ai/src/providers/openai-codex-state.ts b/packages/ai/src/providers/openai-codex-state.ts
+index 5086c329e2..ce9f9b9f18 100644
+--- a/packages/ai/src/providers/openai-codex-state.ts
++++ b/packages/ai/src/providers/openai-codex-state.ts
+@@ -45,6 +45,7 @@ export function createCodexProviderSessionState(): CodexProviderSessionState {
+ 		webSocketPublicToPrivate: new Map(),
+ 		metadataSessions: new Map(),
+ 		effortControls: new Map(),
++		rejectedReasoning: new Set(),
+ 		releaseSession: sessionId => {
+ 			const normalizedSessionId = normalizeOpenAIPromptCacheKey(sessionId);
+ 			if (!normalizedSessionId) return;
+@@ -67,6 +68,7 @@ export function createCodexProviderSessionState(): CodexProviderSessionState {
+ 			state.webSocketPublicToPrivate.clear();
+ 			state.metadataSessions.clear();
+ 			state.effortControls.clear();
++			state.rejectedReasoning.clear();
+ 		},
+ 	};
+ 	return state;
+@@ -82,7 +84,9 @@ function isCodexProviderSessionState(state: ProviderSessionState | undefined): s
+ 		"metadataSessions" in state &&
+ 		state.metadataSessions instanceof Map &&
+ 		"effortControls" in state &&
+-		state.effortControls instanceof Map
++		state.effortControls instanceof Map &&
++		"rejectedReasoning" in state &&
++		state.rejectedReasoning instanceof Set
+ 	);
+ }
+ 
+diff --git a/packages/ai/src/providers/openai-codex/replayed-reasoning.ts b/packages/ai/src/providers/openai-codex/replayed-reasoning.ts
+new file mode 100644
+index 0000000000..036b0b22f3
+--- /dev/null
++++ b/packages/ai/src/providers/openai-codex/replayed-reasoning.ts
+@@ -0,0 +1,73 @@
++/**
++ * Replayed reasoning the Codex backend refuses.
++ *
++ * A request replays earlier turns' reasoning items with their
++ * `encrypted_content`. When the backend refuses one (content minted for
++ * another account after a usage-limit or auth failover, or an item without the
++ * output item it led to) it fails the whole request: 400
++ * `invalid_encrypted_content`, or "…was provided without its required
++ * following item". Nothing in the replayed history says which account minted
++ * an item, so the request is replayed once without any reasoning, and the
++ * refused items are remembered for the session so later turns leave them out
++ * instead of failing on them again.
++ */
++import { logger } from "@oh-my-pi/pi-utils";
++import type { InputItem, RequestBody } from "./request-transformer";
++
++const REJECTION_CODES: Readonly<Record<string, true>> = {
++	invalid_encrypted_content: true,
++};
++/** "The encrypted content for item rs_… could not be verified." and the missing-following-item rejection. */
++const REJECTION_PATTERN = /\bencrypted content\b.*\bcould not be\b|\bwithout its required following item\b/i;
++
++/** Hashes of the `encrypted_content` a session's requests carried when the backend rejected them. */
++export type RejectedCodexReasoning = Set<string>;
++
++function encryptedContentKey(item: InputItem): string | undefined {
++	if (item.type !== "reasoning" || !("encrypted_content" in item)) return undefined;
++	const encrypted = item.encrypted_content;
++	return typeof encrypted === "string" && encrypted.length > 0 ? Bun.hash(encrypted).toString(36) : undefined;
++}
++
++/** Leave out of `body` the reasoning items an earlier request of this session had rejected. */
++export function dropRememberedRejectedCodexReasoning(
++	body: RequestBody,
++	rejected: RejectedCodexReasoning | undefined,
++): void {
++	if (!rejected?.size || !body.input) return;
++	body.input = body.input.filter(item => {
++		const key = encryptedContentKey(item);
++		return key === undefined || !rejected.has(key);
++	});
++}
++
++/**
++ * Strip every reasoning item from `body` when `error` is the backend rejecting
++ * replayed reasoning, remembering their content in `rejected`. Returns `true`
++ * when the caller should replay the request; at most once per body, since no
++ * reasoning is left to strip.
++ */
++export function dropRejectedCodexReasoning(
++	body: RequestBody,
++	error: unknown,
++	rejected: RejectedCodexReasoning | undefined,
++): boolean {
++	if (!body.input?.some(item => item.type === "reasoning") || !isReplayedReasoningRejection(error)) return false;
++	for (const item of body.input) {
++		const key = encryptedContentKey(item);
++		if (key !== undefined) rejected?.add(key);
++	}
++	body.input = body.input.filter(item => item.type !== "reasoning");
++	logger.warn("Codex rejected the replayed reasoning; retrying without it", {
++		model: body.model,
++		error: error instanceof Error ? error.message : String(error),
++	});
++	return true;
++}
++
++function isReplayedReasoningRejection(error: unknown): boolean {
++	if (!(error instanceof Error)) return false;
++	const code = "code" in error && typeof error.code === "string" ? error.code : undefined;
++	if (code !== undefined && Object.hasOwn(REJECTION_CODES, code)) return true;
++	return REJECTION_PATTERN.test(error.message);
++}
+diff --git a/packages/ai/src/providers/openai-responses-server.ts b/packages/ai/src/providers/openai-responses-server.ts
+index d40cf4b10d..92c3cf5b39 100644
+--- a/packages/ai/src/providers/openai-responses-server.ts
++++ b/packages/ai/src/providers/openai-responses-server.ts
+@@ -428,23 +428,9 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
+ 							id: msg.id,
+ 							phase: msg.phase,
+ 						});
+-						messages.push({
+-							role: "assistant",
+-							content: parts,
+-							api: "openai-responses",
+-							provider: "openai",
+-							model: data.model,
+-							usage: {
+-								input: 0,
+-								output: 0,
+-								cacheRead: 0,
+-								cacheWrite: 0,
+-								totalTokens: 0,
+-								cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+-							},
+-							stopReason: "stop",
+-							timestamp: now,
+-						});
++						// One response's output items (reasoning, messages, calls) form one
++						// assistant turn, so a message joins the turn its reasoning opened.
++						ensureAssistantPlaceholder(messages, data.model, now).content.push(...parts);
+ 						break;
+ 					}
+ 				}
+diff --git a/packages/ai/src/providers/openai-shared.ts b/packages/ai/src/providers/openai-shared.ts
+index df31fa03e6..ef5e7238bd 100644
+--- a/packages/ai/src/providers/openai-shared.ts
++++ b/packages/ai/src/providers/openai-shared.ts
+@@ -2657,6 +2657,29 @@ function isResponsesAssistantTurnBoundary(item: ResponseInput[number]): boolean
+ 	return "role" in item && item.role !== "assistant";
+ }
+ 
++/**
++ * Drop each reasoning item that no output item of its own turn follows. The
++ * Responses API rejects a replayed reasoning item without the item it led to
++ * ("Item 'rs_…' of type 'reasoning' was provided without its required
++ * following item"); a turn cut after its reasoning, or whose call was never
++ * delivered, leaves exactly that. Item ids play no part: Codex strips them
++ * from every input item it sends.
++ */
++export function dropUnfollowedResponsesReasoning(items: ResponseInput): ResponseInput {
++	const kept: ResponseInput = [];
++	let followed = false;
++	for (let index = items.length - 1; index >= 0; index--) {
++		const item = items[index];
++		if (item.type === "reasoning") {
++			if (followed) kept.push(item);
++			continue;
++		}
++		followed = item.type !== "item_reference" && !isResponsesAssistantTurnBoundary(item);
++		kept.push(item);
++	}
++	return kept.length === items.length ? items : kept.reverse();
++}
++
+ function ensureRequiredResponsesReasoningReplay(
+ 	items: ResponseInput,
+ 	stopReason: AssistantMessage["stopReason"],
+diff --git a/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts b/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
+index 66c56a5bb1..66422d1c41 100644
+--- a/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
++++ b/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
+@@ -1,13 +1,26 @@
+-import { describe, expect, it } from "bun:test";
++import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+ import { parseRequest as parseMessagesRequest } from "@oh-my-pi/pi-ai/providers/anthropic-messages-server";
+ import { parseRequest } from "@oh-my-pi/pi-ai/providers/openai-chat-server";
+-import { convertCodexResponsesMessages } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
++import {
++	buildTransformedCodexRequestBody,
++	convertCodexResponsesMessages,
++	streamOpenAICodexResponses,
++} from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+ import { encodeStream, parseRequest as parseResponsesRequest } from "@oh-my-pi/pi-ai/providers/openai-responses-server";
+ import type { ResponseInput } from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
+ import { transformMessages } from "@oh-my-pi/pi-ai/providers/transform-messages";
+-import type { Api, AssistantMessage, Context, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
++import type {
++	Api,
++	AssistantMessage,
++	Context,
++	FetchImpl,
++	Model,
++	ModelSpec,
++	ProviderSessionState,
++} from "@oh-my-pi/pi-ai/types";
+ import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
+ import { buildModel } from "@oh-my-pi/pi-catalog/build";
++import * as piUtils from "@oh-my-pi/pi-utils";
+ import { createCodexModel } from "./helpers";
+ 
+ /**
+@@ -283,3 +296,255 @@ describe("auth-gateway replay of streamed reasoning to Anthropic", () => {
+ 		expect(blocks.map(block => block.type)).toEqual(["toolCall"]);
+ 	});
+ });
++
++/** Every item Codex receives for `context`, as `type` (and `:role` for messages); item ids, if any, follow `#`. */
++async function codexWire(context: Context, model = createCodexModel("gpt-6-luna")): Promise<string[]> {
++	const body = await buildTransformedCodexRequestBody(model, context, undefined);
++	return (body.input ?? []).map(item => {
++		const type = item.type ?? "message";
++		const role = type === "message" ? `:${item.role}` : "";
++		return `${type}${role}${item.id ? `#${item.id}` : ""}`;
++	});
++}
++
++function responsesUser(text: string) {
++	return { type: "message", role: "user", content: [{ type: "input_text", text }] };
++}
++
++describe("Codex reasoning reaches the wire only with the item it led to", () => {
++	it("sends a Codex client's reasoning, commentary and call as one turn", async () => {
++		const { context } = parseResponsesRequest({
++			model: "openai-codex/gpt-6-luna",
++			input: [
++				responsesUser("Find the stairs."),
++				CODEX_REASONING_ITEM,
++				{
++					type: "message",
++					role: "assistant",
++					id: "msg_own",
++					phase: "commentary",
++					content: [{ type: "output_text", text: "Looking around." }],
++				},
++				{ type: "function_call", id: "fc_own", call_id: "call_move", name: "nh", arguments: '{"cmd":"l"}' },
++				{ type: "function_call_output", call_id: "call_move", output: "A staircase." },
++			],
++		});
++
++		expect(context.messages.map(m => m.role)).toEqual(["user", "assistant", "toolResult"]);
++		expect(await codexWire(context)).toEqual([
++			"message:user",
++			"reasoning",
++			"message:assistant",
++			"function_call",
++			"function_call_output",
++		]);
++	});
++
++	it("sends a Codex client's reasoning with the final answer it led to", async () => {
++		const { context } = parseResponsesRequest({
++			model: "openai-codex/gpt-6-luna",
++			input: [
++				responsesUser("Hi."),
++				CODEX_REASONING_ITEM,
++				{
++					type: "message",
++					role: "assistant",
++					id: "msg_own",
++					phase: "final_answer",
++					content: [{ type: "output_text", text: "Hello." }],
++				},
++				responsesUser("Next."),
++			],
++		});
++
++		expect(await codexWire(context)).toEqual(["message:user", "reasoning", "message:assistant", "message:user"]);
++	});
++
++	it("leaves out a Codex client's reasoning whose call never reached it", async () => {
++		const { context } = parseResponsesRequest({
++			model: "openai-codex/gpt-6-luna",
++			input: [responsesUser("Find the stairs."), CODEX_REASONING_ITEM, responsesUser("Continue.")],
++		});
++
++		expect(await codexWire(context)).toEqual(["message:user", "message:user"]);
++	});
++
++	it("leaves out a Claude client's thinking whose tool_use never reached it", async () => {
++		const { context } = parseMessagesRequest({
++			model: "openai-codex/gpt-6-luna",
++			max_tokens: 1_000,
++			messages: [
++				{ role: "user", content: "Find the stairs." },
++				{
++					role: "assistant",
++					content: [
++						{ type: "thinking", thinking: ROUTE_SUMMARY, signature: JSON.stringify(CODEX_REASONING_ITEM) },
++					],
++				},
++				{ role: "user", content: "Continue." },
++			],
++		});
++
++		expect(await codexWire(context)).toEqual(["message:user", "message:user"]);
++	});
++
++	it("drops a cut thinking-only turn and keeps a later turn's reasoning", async () => {
++		const later = { ...CODEX_REASONING_ITEM, id: "rs_later", encrypted_content: "later-encrypted-reasoning" };
++		const { context } = parseMessagesRequest({
++			model: "openai-codex/gpt-6-luna",
++			max_tokens: 1_000,
++			messages: [
++				{ role: "user", content: "Find the stairs." },
++				{
++					role: "assistant",
++					content: [
++						{ type: "thinking", thinking: ROUTE_SUMMARY, signature: JSON.stringify(CODEX_REASONING_ITEM) },
++					],
++				},
++				{ role: "user", content: "Continue." },
++				{
++					role: "assistant",
++					content: [
++						{ type: "thinking", thinking: MAP_SUMMARY, signature: JSON.stringify(later) },
++						{ type: "tool_use", id: "toolu_move", name: "nh", input: { cmd: "l" } },
++					],
++				},
++				{ role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_move", content: "A staircase." }] },
++			],
++		});
++		const body = await buildTransformedCodexRequestBody(createCodexModel("gpt-6-luna"), context, undefined);
++
++		expect(await codexWire(context)).toEqual([
++			"message:user",
++			"message:user",
++			"reasoning",
++			"function_call",
++			"function_call_output",
++		]);
++		expect(encryptedReasoning((body.input ?? []) as ResponseInput)).toEqual(["later-encrypted-reasoning"]);
++	});
++});
++
++const COMPLETED_SSE = `${[
++	{ type: "response.output_text.delta", delta: "Down we go." },
++	{
++		type: "response.completed",
++		response: {
++			status: "completed",
++			usage: { input_tokens: 5, output_tokens: 3, total_tokens: 8, input_tokens_details: { cached_tokens: 0 } },
++		},
++	},
++]
++	.map(event => `data: ${JSON.stringify(event)}`)
++	.join("\n\n")}\n\n`;
++
++function codexToken(accountId: string): string {
++	const claims = { "https://api.openai.com/auth": { chatgpt_account_id: accountId } };
++	return `aaa.${Buffer.from(JSON.stringify(claims), "utf8").toBase64()}.bbb`;
++}
++
++function requestInput(body: RequestInit["body"]): Record<string, unknown>[] {
++	const text = typeof body === "string" ? body : new TextDecoder().decode(Bun.zstdDecompressSync(body as Uint8Array));
++	return (JSON.parse(text) as { input: Record<string, unknown>[] }).input;
++}
++
++/**
++ * A Codex account that refuses every request replaying {@link ENCRYPTED} (minted for another
++ * account) with `refusal`, and records the reasoning each request carried.
++ */
++function codexBackend(refusal: () => Response, sentReasoning: unknown[][]): FetchImpl {
++	return (async (input: string | URL, init?: RequestInit) => {
++		if (!String(input).endsWith("/responses")) return new Response("not found", { status: 404 });
++		const encrypted = requestInput(init?.body)
++			.filter(item => item.type === "reasoning")
++			.map(item => item.encrypted_content);
++		sentReasoning.push(encrypted);
++		if (encrypted.includes(ENCRYPTED)) return refusal();
++		return new Response(COMPLETED_SSE, { headers: { "content-type": "text/event-stream" } });
++	}) as FetchImpl;
++}
++
++/** A Codex client's next request on gpt-6.1-sol, replaying a turn whose reasoning another account or model minted. */
++function sessionContext(extra: unknown[] = []): Context {
++	return parseResponsesRequest({
++		model: "openai-codex/gpt-6.1-sol",
++		input: [
++			responsesUser("Find the stairs."),
++			CODEX_REASONING_ITEM,
++			{ type: "function_call", call_id: "call_move", name: "nh", arguments: '{"cmd":"l"}' },
++			{ type: "function_call_output", call_id: "call_move", output: "A staircase." },
++			...extra,
++			responsesUser("Descend."),
++		],
++	} as never).context;
++}
++
++describe("Codex rejecting replayed reasoning", () => {
++	const model = createCodexModel("gpt-6.1-sol", { preferWebsockets: false });
++
++	beforeEach(() => {
++		vi.spyOn(piUtils, "getInstallId").mockReturnValue("00000000-0000-4000-8000-000000000001");
++	});
++
++	afterEach(() => {
++		vi.restoreAllMocks();
++	});
++
++	it("retries once without the reasoning and leaves it out for the rest of the session", async () => {
++		const sent: unknown[][] = [];
++		const providerSessionState = new Map<string, ProviderSessionState>();
++		const rejection = () =>
++			Response.json(
++				{
++					error: {
++						message: "The encrypted content for item rs_own could not be verified.",
++						type: "invalid_request_error",
++						param: null,
++						code: "invalid_encrypted_content",
++					},
++				},
++				{ status: 400 },
++			);
++		const run = (context: Context) =>
++			streamOpenAICodexResponses(model, context, {
++				apiKey: codexToken("acct-b"),
++				fetch: codexBackend(rejection, sent),
++				providerSessionState,
++			}).result();
++
++		expect((await run(sessionContext())).stopReason).toBe("stop");
++		expect(sent).toEqual([[ENCRYPTED], []]);
++
++		// The next turn adds reasoning this account minted; only that one is sent.
++		sent.length = 0;
++		const ownTurn = [
++			{ ...CODEX_REASONING_ITEM, id: "rs_new", encrypted_content: "minted-by-acct-b" },
++			{ type: "message", role: "assistant", content: [{ type: "output_text", text: "Stairs found." }] },
++		];
++		expect((await run(sessionContext(ownTurn))).stopReason).toBe("stop");
++		expect(sent).toEqual([["minted-by-acct-b"]]);
++	});
++
++	it("retries without the reasoning when the stream reports it lacks its following item", async () => {
++		const sent: unknown[][] = [];
++		const missingFollowingItem = () =>
++			new Response(
++				`data: ${JSON.stringify({
++					type: "error",
++					error: {
++						type: "invalid_request_error",
++						message: "Item 'rs_own' of type 'reasoning' was provided without its required following item.",
++						param: "input",
++					},
++				})}\n\n`,
++				{ headers: { "content-type": "text/event-stream" } },
++			);
++		const result = await streamOpenAICodexResponses(model, sessionContext(), {
++			apiKey: codexToken("acct-b"),
++			fetch: codexBackend(missingFollowingItem, sent),
++		}).result();
++
++		expect(result.stopReason).toBe("stop");
++		expect(sent).toEqual([[ENCRYPTED], []]);
++	});
++});

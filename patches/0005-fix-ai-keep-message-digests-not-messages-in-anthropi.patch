@@ -1,0 +1,290 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Davis <1709934+Savid@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 16:25:59 +1000
+Subject: [PATCH] fix(ai): keep message digests, not messages, in anthropic
+ thread anchors
+
+A thread anchor outlives its request: it holds the conversation the server
+stored, so the next request can be checked to extend it. It held that
+conversation as the messages themselves, screenshots included. In-process
+omp keeps one session, but the auth gateway keeps provider state for up to
+256 conversations, each with its own anchor, so every conversation it
+served stayed pinned until another replaced or evicted it.
+
+On a busy gateway, 11 anchors held 185 MB of a 362 MB live heap,
+the bulk of it base64 screenshots in tool results. With the per-request
+garbage on top, the gateway crossed its 1 GiB limit and was killed by the
+kernel 24 times in four days, cutting every stream in flight.
+
+An anchor now keeps one 128-bit digest per message, computed without cache
+breakpoints and with object keys sorted, so it continues and refuses
+exactly the conversations it did before at a few dozen bytes a message.
+
+Upstream-Status: Pending
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../ai/src/providers/anthropic-threads.ts     |  74 +++++++----
+ .../anthropic-message-thread-anchors.test.ts  | 118 ++++++++++++++++++
+ 2 files changed, 166 insertions(+), 26 deletions(-)
+ create mode 100644 packages/ai/test/anthropic-message-thread-anchors.test.ts
+
+diff --git a/packages/ai/src/providers/anthropic-threads.ts b/packages/ai/src/providers/anthropic-threads.ts
+index 2274f42578..1f79e56457 100644
+--- a/packages/ai/src/providers/anthropic-threads.ts
++++ b/packages/ai/src/providers/anthropic-threads.ts
+@@ -91,8 +91,14 @@ export interface AnthropicThreadChain {
+ interface AnthropicThreadAnchor {
+ 	/** Response `id` a continue names as `previous_message_id`. */
+ 	messageId: string;
+-	/** Conversation the server holds for `messageId`: the request's full messages, then the response. */
+-	messages: readonly MessageParam[];
++	/**
++	 * Conversation the server holds for `messageId` (the request's full
++	 * messages, then the response), one {@link messageDigest} per message. A
++	 * digest rather than the message: an anchor outlives its request, and an
++	 * agent conversation with screenshots runs to tens of megabytes, which a
++	 * gateway would otherwise pin once for every conversation it serves.
++	 */
++	digests: readonly string[];
+ 	/** Fixed and create-only fields of the thread; any change starts a new thread. */
+ 	fingerprint: ThreadFingerprint;
+ 	/** When the response was stored (`Date.now()`). */
+@@ -190,6 +196,8 @@ export class AnthropicThreadTurn {
+ 				params: MessageCreateParamsStreaming;
+ 				betaHeader: string;
+ 				fingerprint: ThreadFingerprint;
++				/** {@link messageDigest} of each of `params.messages`. */
++				digests: readonly string[];
+ 				request: AnthropicThreadRequest;
+ 		  }
+ 		| undefined;
+@@ -217,19 +225,20 @@ export class AnthropicThreadTurn {
+ 		if (planned?.params === params && planned.betaHeader === betaHeader) return planned.request;
+ 
+ 		const fingerprint = fingerprintOf(params, betaHeader);
++		const digests = params.messages.map(messageDigest);
+ 		const anchor = this.#forceCreate ? undefined : (this.#claimed ?? this.#chain.anchor);
+ 		let request: AnthropicThreadRequest;
+ 		if (
+ 			anchor &&
+ 			now - anchor.storedAt < THREAD_REUSE_WINDOW_MS &&
+ 			Bun.deepEquals(anchor.fingerprint, fingerprint) &&
+-			extendsConversation(params.messages, anchor.messages)
++			extendsConversation(digests, anchor.digests)
+ 		) {
+ 			this.#claimed = anchor;
+ 			if (this.#chain.anchor === anchor) this.#chain.anchor = undefined;
+ 			const body: MessageCreateParamsStreaming = {
+ 				...params,
+-				messages: continueBreakpoints(params.messages.slice(anchor.messages.length)),
++				messages: continueBreakpoints(params.messages.slice(anchor.digests.length)),
+ 				thread: { type: "continue", previous_message_id: anchor.messageId },
+ 			};
+ 			if (!this.#resendSystemAndTools) {
+@@ -240,7 +249,7 @@ export class AnthropicThreadTurn {
+ 		} else {
+ 			request = { kind: "create", body: { ...params, thread: { type: "create" } } };
+ 		}
+-		this.#planned = { params, betaHeader, fingerprint, request };
++		this.#planned = { params, betaHeader, fingerprint, digests, request };
+ 		return request;
+ 	}
+ 
+@@ -303,7 +312,7 @@ export class AnthropicThreadTurn {
+ 		if (planned.request.kind === "continue" || !this.#forceCreate) this.#chain.refusedContinues = 0;
+ 		this.#chain.anchor = stored && {
+ 			messageId: stored.messageId,
+-			messages: [...planned.params.messages, stored.message],
++			digests: [...planned.digests, messageDigest(stored.message)],
+ 			fingerprint: planned.fingerprint,
+ 			storedAt: now,
+ 		};
+@@ -358,31 +367,44 @@ function threadErrorCode(error: unknown): string | undefined {
+ 	return THREAD_ERROR_TEXT.test(message) ? "thread_invalid_request" : undefined;
+ }
+ 
+-/** Whether `messages` appends at least one message to `held`, ignoring cache breakpoints. */
+-function extendsConversation(messages: readonly MessageParam[], held: readonly MessageParam[]): boolean {
+-	if (messages.length <= held.length) return false;
++/** Whether `digests` appends at least one message to the `held` conversation. */
++function extendsConversation(digests: readonly string[], held: readonly string[]): boolean {
++	if (digests.length <= held.length) return false;
+ 	for (let index = 0; index < held.length; index++) {
+-		if (!sameMessage(messages[index], held[index])) return false;
++		if (digests[index] !== held[index]) return false;
+ 	}
+ 	return true;
+ }
+ 
+-function sameMessage(a: MessageParam, b: MessageParam): boolean {
+-	if (a === b) return true;
+-	if (a.role !== b.role || a.clear_at !== b.clear_at || !Bun.deepEquals(a.output_config, b.output_config)) {
+-		return false;
+-	}
+-	if (typeof a.content === "string" || typeof b.content === "string") {
+-		const text = soleText(a.content);
+-		return text !== undefined && text === soleText(b.content);
+-	}
+-	if (a.content.length !== b.content.length) return false;
+-	for (let index = 0; index < a.content.length; index++) {
+-		if (!Bun.deepEquals(withoutCacheControl(a.content[index]), withoutCacheControl(b.content[index]))) {
+-			return false;
+-		}
+-	}
+-	return true;
++/**
++ * A message's identity for continuing a thread, ignoring cache breakpoints:
++ * two messages get the same digest when the server would hold them as the
++ * same message. String content and a lone text block that differs from it
++ * only by a breakpoint digest alike, since caching rewrites the one into the
++ * other. 128 bits of hash plus the length of what was hashed, so a collision
++ * that would continue the wrong conversation is not a practical concern.
++ */
++export function messageDigest(message: MessageParam): string {
++	const text = soleText(message.content);
++	const canonical = stableJson([
++		message.role,
++		message.clear_at,
++		message.output_config,
++		text !== undefined ? { text } : (message.content as ContentBlockParam[]).map(withoutCacheControl),
++	]);
++	const high = Bun.hash.wyhash(canonical, 0x6d65_7373n);
++	const low = Bun.hash.wyhash(canonical, 0x6469_6765n);
++	return `${high.toString(36)}.${low.toString(36)}.${canonical.length.toString(36)}`;
++}
++
++/** JSON with object keys sorted and `undefined` properties left out, so equal values serialize alike whatever their key order. */
++function stableJson(value: unknown): string {
++	return JSON.stringify(value, (_key, inner: unknown) => {
++		if (inner === null || typeof inner !== "object" || Array.isArray(inner)) return inner;
++		const sorted: Record<string, unknown> = {};
++		for (const key of Object.keys(inner).sort()) sorted[key] = (inner as Record<string, unknown>)[key];
++		return sorted;
++	});
+ }
+ 
+ /**
+diff --git a/packages/ai/test/anthropic-message-thread-anchors.test.ts b/packages/ai/test/anthropic-message-thread-anchors.test.ts
+new file mode 100644
+index 0000000000..6b2f1ab76e
+--- /dev/null
++++ b/packages/ai/test/anthropic-message-thread-anchors.test.ts
+@@ -0,0 +1,118 @@
++/**
++ * What a session's thread anchor keeps between requests. An anchor outlives
++ * its request, so it must not pin the conversation: a gateway retains one per
++ * conversation it serves, and an agent conversation with screenshots runs to
++ * tens of megabytes.
++ */
++import { describe, expect, it } from "bun:test";
++import {
++	type AnthropicThreadChain,
++	AnthropicThreadTurn,
++	messageDigest,
++} from "@oh-my-pi/pi-ai/providers/anthropic-threads";
++import type { MessageCreateParamsStreaming, MessageParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
++
++const SCREENSHOT = "A".repeat(2_000_000);
++
++function params(messages: MessageParam[]): MessageCreateParamsStreaming {
++	return { model: "claude-opus-5-5", max_tokens: 1024, stream: true, messages };
++}
++
++describe("messageDigest", () => {
++	it("ignores cache breakpoints and key order", () => {
++		const plain: MessageParam = {
++			role: "user",
++			content: [{ type: "tool_result", tool_use_id: "t1", content: [{ type: "text", text: "out" }] }],
++		};
++		const marked: MessageParam = {
++			content: [
++				{
++					content: [{ text: "out", type: "text" }],
++					tool_use_id: "t1",
++					type: "tool_result",
++					cache_control: { type: "ephemeral" },
++				},
++			],
++			role: "user",
++		};
++		expect(messageDigest(marked)).toBe(messageDigest(plain));
++	});
++
++	it("digests string content like the lone text block caching rewrites it into", () => {
++		expect(messageDigest({ role: "user", content: "hi" })).toBe(
++			messageDigest({ role: "user", content: [{ type: "text", text: "hi", cache_control: { type: "ephemeral" } }] }),
++		);
++	});
++
++	it("tells apart messages that differ in role or content", () => {
++		const base = messageDigest({ role: "user", content: "hi" });
++		expect(messageDigest({ role: "assistant", content: "hi" })).not.toBe(base);
++		expect(messageDigest({ role: "user", content: "hi!" })).not.toBe(base);
++		expect(
++			messageDigest({
++				role: "user",
++				content: [
++					{ type: "text", text: "hi" },
++					{ type: "text", text: "" },
++				],
++			}),
++		).not.toBe(base);
++	});
++});
++
++describe("AnthropicThreadTurn anchors", () => {
++	it("keeps digests, not the conversation, and still continues it", () => {
++		const chain: AnthropicThreadChain = { refusedContinues: 0, disabled: false };
++		const first: MessageParam[] = [
++			{
++				role: "user",
++				content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: SCREENSHOT } }],
++			},
++		];
++		const reply: MessageParam = { role: "assistant", content: [{ type: "text", text: "seen" }] };
++
++		const turn = new AnthropicThreadTurn(chain, { resendSystemAndTools: false });
++		expect(turn.plan(params(first), "", 1_000)?.kind).toBe("create");
++		turn.settle({ messageId: "msg_1", message: reply }, 1_000);
++
++		expect(chain.anchor?.messageId).toBe("msg_1");
++		expect(JSON.stringify(chain.anchor).length).toBeLessThan(1_000);
++
++		// The next request carries the conversation again, the screenshot as a fresh copy.
++		const again: MessageParam[] = [
++			{
++				role: "user",
++				content: [
++					{
++						type: "image",
++						source: { type: "base64", media_type: "image/png", data: `${SCREENSHOT.slice(0, -1)}A` },
++					},
++				],
++			},
++			{ role: "assistant", content: [{ type: "text", text: "seen", cache_control: { type: "ephemeral" } }] },
++			{ role: "user", content: "next" },
++		];
++		const next = new AnthropicThreadTurn(chain, { resendSystemAndTools: false }).plan(params(again), "", 2_000);
++		expect(next?.kind).toBe("continue");
++		expect(next?.body.messages).toHaveLength(1);
++		expect(next?.body.thread).toEqual({ type: "continue", previous_message_id: "msg_1" });
++	});
++
++	it("starts a new thread when an earlier message changed", () => {
++		const chain: AnthropicThreadChain = { refusedContinues: 0, disabled: false };
++		const turn = new AnthropicThreadTurn(chain, { resendSystemAndTools: false });
++		turn.plan(params([{ role: "user", content: "first" }]), "", 1_000);
++		turn.settle({ messageId: "msg_1", message: { role: "assistant", content: "ok" } }, 1_000);
++
++		const edited = new AnthropicThreadTurn(chain, { resendSystemAndTools: false }).plan(
++			params([
++				{ role: "user", content: "first, edited" },
++				{ role: "assistant", content: "ok" },
++				{ role: "user", content: "next" },
++			]),
++			"",
++			2_000,
++		);
++		expect(edited?.kind).toBe("create");
++	});
++});

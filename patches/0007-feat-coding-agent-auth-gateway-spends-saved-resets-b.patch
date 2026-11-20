@@ -1,0 +1,451 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Davis <1709934+Savid@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 10:31:33 +1000
+Subject: [PATCH] feat(coding-agent): auth gateway spends saved resets before
+ they expire
+
+Sessions salvage a saved Claude or Codex reset that is about to expire
+unused, but only while a session runs and only for its own process. A
+gateway serving other clients has no session, so its accounts' resets
+expire unspent.
+
+`omp auth-gateway serve` now runs the same salvage on a five-minute timer
+(session/reset-salvage.ts), with the planners and consent settings a
+session uses: `codexResets.autoRedeem5h`/`autoRedeemWeekly`,
+`claudeResets.autoRedeem5h`/`autoRedeemWeekly`/`autoRedeemFable`, and
+`salvageHorizonHours`. It only salvages (the planners' `sweep` trigger);
+spending a reset to lift a block stays with the session whose request hit
+it. Only `yes` spends: with nothing set to `yes` no timer starts. Each
+spend takes the same cross-process fence as `omp usage reset`, rechecks a
+Codex balance under it, is attempted once per credit, and a failure that
+may pass is deferred for 30 minutes.
+
+Upstream-Status: Pending
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../coding-agent/src/cli/auth-gateway-cli.ts  |   9 +
+ .../coding-agent/src/session/reset-salvage.ts | 222 ++++++++++++++++++
+ .../coding-agent/test/reset-salvage.test.ts   | 151 ++++++++++++
+ 3 files changed, 382 insertions(+)
+ create mode 100644 packages/coding-agent/src/session/reset-salvage.ts
+ create mode 100644 packages/coding-agent/test/reset-salvage.test.ts
+
+diff --git a/packages/coding-agent/src/cli/auth-gateway-cli.ts b/packages/coding-agent/src/cli/auth-gateway-cli.ts
+index d129a8cc36..fcee55a1b4 100644
+--- a/packages/coding-agent/src/cli/auth-gateway-cli.ts
++++ b/packages/coding-agent/src/cli/auth-gateway-cli.ts
+@@ -56,6 +56,7 @@ import {
+ 	resolveAuthBrokerConfig,
+ 	resolveEffectiveSettings,
+ } from "../session/auth-broker-config";
++import { resetSalvageProviders, startResetSalvage } from "../session/reset-salvage";
+ import { GATEWAY_MODEL_KINDS, runAuthGatewayStdio } from "./auth-gateway-stdio";
+ import { generateToken, readTokenFile, writeTokenFile } from "./token-file";
+ 
+@@ -456,6 +457,13 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+ 	}
+ 	process.stdout.write(`upstream broker: ${brokerConfig.url}\n`);
+ 
++	// Spend saved resets about to expire unused, for the providers whose
++	// `claudeResets.*` or `codexResets.*` consent says `yes`.
++	const resetSalvage = startResetSalvage({ storage, settings });
++	if (resetSalvage) {
++		process.stdout.write(`reset salvage: ${resetSalvageProviders(settings).join(", ")}\n`);
++	}
++
+ 	// `serve` is long-lived: rebuild the catalog periodically so models
+ 	// discovered after boot (for providers we already hold credentials for)
+ 	// become routable without a restart. A failed rebuild keeps serving the
+@@ -507,6 +515,7 @@ async function runServe(flags: AuthGatewayCommandArgs["flags"]): Promise<void> {
+ 		clearInterval(catalogRefresh);
+ 		clearInterval(credentialSync);
+ 		clearInterval(clientsReload);
++		resetSalvage?.stop();
+ 		let closeError: unknown;
+ 		try {
+ 			await handle.close();
+diff --git a/packages/coding-agent/src/session/reset-salvage.ts b/packages/coding-agent/src/session/reset-salvage.ts
+new file mode 100644
+index 0000000000..b8a45c36e7
+--- /dev/null
++++ b/packages/coding-agent/src/session/reset-salvage.ts
+@@ -0,0 +1,222 @@
++/**
++ * Saved-reset salvage for a long-lived broker client such as
++ * `omp auth-gateway serve`, which has no session to run it.
++ *
++ * A Claude or Codex saved reset about to expire unused is spent, under the
++ * consent settings (`claudeResets.*`, `codexResets.*`) and the planners an
++ * interactive session uses. Only the planners' `sweep` trigger runs here: a
++ * reset is spent to salvage it before it expires, never to lift a block, which
++ * is left to the session whose request hit it. A window whose consent is
++ * `unset` is never spent, as in any session that cannot ask.
++ */
++import type { AuthStorage, ResetCreditAccountStatus, ResetCreditRedeemOutcome, UsageReport } from "@oh-my-pi/pi-ai";
++import { logger } from "@oh-my-pi/pi-utils";
++import type { Settings } from "../config/settings";
++import {
++	type ClaudeResetAction,
++	claudeResetStatusesFromReports,
++	planClaudeResetRedemptions,
++} from "./claude-auto-reset";
++import {
++	type CodexAutoRedeemCoordinator,
++	type CodexResetAction,
++	createCodexAutoRedeemCoordinator,
++	isTerminalRedeemOutcome,
++	overlayLiveResetCredits,
++	planCodexResetRedemptions,
++	REDEEM_RETRY_DEFER_MS,
++	resetAccountLockKey,
++	resetPlanSettings,
++	resetWindowMode,
++} from "./codex-auto-reset";
++import { checkCodexBalance, resetLockPath, withResetFence } from "./reset-fence";
++import { cfgClaudeResets, cfgCodexResets, resetWindowModes } from "./settings";
++
++type SalvageProvider = "openai-codex" | "anthropic";
++type SalvageAction = CodexResetAction | ClaudeResetAction;
++
++const PROVIDERS: readonly SalvageProvider[] = ["openai-codex", "anthropic"];
++
++/** How often a sweep runs. The planners' salvage horizon is hours, so minutes are plenty. */
++export const RESET_SALVAGE_INTERVAL_MS = 5 * 60_000;
++
++/** The first sweep waits this long after start, so usage reports are warm. */
++const FIRST_SWEEP_DELAY_MS = 60_000;
++
++export interface ResetSalvageOptions {
++	storage: AuthStorage;
++	settings: Settings;
++	baseUrlResolver?: (provider: string) => string | undefined;
++	/** Attempt state kept across sweeps; a fresh one by default. Tests set its `resetLockPath`. */
++	coordinator?: CodexAutoRedeemCoordinator;
++}
++
++export interface ResetSalvage {
++	/** Plan and spend once. Resolves with the credential ids whose reset was spent. */
++	sweep(signal?: AbortSignal): Promise<number[]>;
++}
++
++/** Providers a headless sweep may spend for: at least one of their windows consents with `yes`. */
++export function resetSalvageProviders(settings: Settings): SalvageProvider[] {
++	return PROVIDERS.filter(provider =>
++		Object.values(resetWindowModes(provider, settings)).some(mode => mode === "yes"),
++	);
++}
++
++export function createResetSalvage(options: ResetSalvageOptions): ResetSalvage {
++	const { storage, settings, baseUrlResolver } = options;
++	const coordinator = options.coordinator ?? createCodexAutoRedeemCoordinator();
++	const listing = (provider: SalvageProvider) =>
++		storage.resets.list({ provider, baseUrlResolver, signal: AbortSignal.timeout(10_000) });
++
++	async function plan(provider: SalvageProvider, reports: UsageReport[]): Promise<SalvageAction[]> {
++		const shared = {
++			nowMs: Date.now(),
++			trigger: "sweep" as const,
++			provider: "",
++			modelId: "",
++			attemptedKeys: coordinator.attemptedKeys,
++			deferredUntilByKey: coordinator.deferredUntilByKey,
++			lastAttemptAtByAccount: coordinator.lastAttemptAtByAccount,
++		};
++		if (provider === "openai-codex") {
++			const statuses = await listing(provider);
++			return planCodexResetRedemptions({
++				...shared,
++				settings: resetPlanSettings(resetWindowModes(provider, settings), cfgCodexResets.get(settings)),
++				identity: undefined,
++				reports: overlayLiveResetCredits(reports, statuses),
++			}).actions;
++		}
++		// Claude finds its candidates in the reports' reset inventory first, so a
++		// sweep with nothing to salvage lists no account upstream.
++		const claude = (statuses: readonly ResetCreditAccountStatus[]) =>
++			planClaudeResetRedemptions({
++				...shared,
++				settings: resetPlanSettings(resetWindowModes(provider, settings), cfgClaudeResets.get(settings)),
++				reports,
++				statuses,
++			}).actions;
++		const candidates = claude(claudeResetStatusesFromReports(storage.oauth.accounts(provider), reports));
++		return candidates.length === 0 ? [] : claude(await listing(provider));
++	}
++
++	/** Spend each action once, fenced against other processes on the same database. */
++	async function spend(provider: SalvageProvider, actions: readonly SalvageAction[]): Promise<number[]> {
++		const spent: number[] = [];
++		for (const action of actions) {
++			if (coordinator.attemptedKeys.has(action.attemptKey)) continue;
++			coordinator.attemptedKeys.add(action.attemptKey);
++			coordinator.lastAttemptAtByAccount.set(action.accountKey, Date.now());
++			const redeem = () =>
++				storage.resets.redeem({ target: action.target, baseUrlResolver, signal: AbortSignal.timeout(15_000) });
++			let outcome: ResetCreditRedeemOutcome | undefined;
++			try {
++				const lockKey = resetAccountLockKey(action.target);
++				outcome = !lockKey
++					? await redeem()
++					: await withResetFence<ResetCreditRedeemOutcome | undefined>(
++							resetLockPath(lockKey, coordinator.resetLockPath),
++							// Another process spent for this account moments ago.
++							async () => undefined,
++							async markedRedeem => {
++								// Claude's redeem rechecks its exact offer; Codex's balance is rechecked here.
++								if (provider === "openai-codex") {
++									const balance = checkCodexBalance(
++										await listing(provider),
++										action.target.credentialId,
++										action.availableCount,
++									);
++									if (balance === "spent") return undefined;
++									if (balance) return { ok: false, code: balance, provider };
++								}
++								return (await markedRedeem(redeem)).outcome;
++							},
++						);
++			} catch (error) {
++				coordinator.attemptedKeys.delete(action.attemptKey);
++				coordinator.deferredUntilByKey.set(action.attemptKey, Date.now() + REDEEM_RETRY_DEFER_MS);
++				logger.warn("reset-salvage: redeem threw, deferred", {
++					provider,
++					account: action.label,
++					error: String(error),
++				});
++				continue;
++			}
++			if (!outcome) continue;
++			if (!isTerminalRedeemOutcome(outcome.code)) {
++				coordinator.attemptedKeys.delete(action.attemptKey);
++				coordinator.deferredUntilByKey.set(action.attemptKey, Date.now() + REDEEM_RETRY_DEFER_MS);
++			}
++			if (outcome.code === "reset") {
++				spent.push(action.target.credentialId);
++				logger.info("reset-salvage: spent a saved reset before it expired", {
++					provider,
++					account: action.label,
++					expiresInMs: action.expiresInMs,
++					window: action.salvageWindow,
++					usedFraction: action.salvageUsedFraction,
++				});
++			} else {
++				logger.warn("reset-salvage: reset not spent", { provider, account: action.label, code: outcome.code });
++			}
++		}
++		return spent;
++	}
++
++	return {
++		async sweep(signal) {
++			const providers = resetSalvageProviders(settings);
++			if (providers.length === 0) return [];
++			const reports = await storage.usage.reports({ baseUrlResolver, signal });
++			if (!reports) return [];
++			const spent: number[] = [];
++			for (const provider of providers) {
++				if (!reports.some(report => report.provider === provider)) continue;
++				try {
++					const modes = resetWindowModes(provider, settings);
++					const consented = (await plan(provider, reports)).filter(
++						action => resetWindowMode(modes, action.window) === "yes",
++					);
++					spent.push(...(await spend(provider, consented)));
++				} catch (error) {
++					logger.warn("reset-salvage: sweep failed", { provider, error: String(error) });
++				}
++			}
++			return spent;
++		},
++	};
++}
++
++/**
++ * Sweep on a timer until stopped. Returns undefined, starting nothing, when no
++ * provider consents; consent is read again on every sweep.
++ */
++export function startResetSalvage(
++	options: ResetSalvageOptions,
++	intervalMs = RESET_SALVAGE_INTERVAL_MS,
++): { stop(): void } | undefined {
++	if (resetSalvageProviders(options.settings).length === 0) return undefined;
++	const salvage = createResetSalvage(options);
++	let running = false;
++	const tick = (): void => {
++		if (running) return;
++		running = true;
++		void salvage
++			.sweep()
++			.catch(error => logger.warn("reset-salvage: sweep failed", { error: String(error) }))
++			.finally(() => {
++				running = false;
++			});
++	};
++	const first = setTimeout(tick, Math.min(FIRST_SWEEP_DELAY_MS, intervalMs));
++	const timer = setInterval(tick, intervalMs);
++	first.unref();
++	timer.unref();
++	return {
++		stop() {
++			clearTimeout(first);
++			clearInterval(timer);
++		},
++	};
++}
+diff --git a/packages/coding-agent/test/reset-salvage.test.ts b/packages/coding-agent/test/reset-salvage.test.ts
+new file mode 100644
+index 0000000000..f827d18a54
+--- /dev/null
++++ b/packages/coding-agent/test/reset-salvage.test.ts
+@@ -0,0 +1,151 @@
++import { afterEach, beforeEach, describe, expect, it } from "bun:test";
++import type {
++	AuthStorage,
++	ResetCreditAccountStatus,
++	ResetCreditRedeemOutcome,
++	ResetCreditTarget,
++	UsageReport,
++} from "@oh-my-pi/pi-ai";
++import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
++import {
++	type CodexAutoRedeemCoordinator,
++	createCodexAutoRedeemCoordinator,
++} from "@oh-my-pi/pi-coding-agent/session/codex-auto-reset";
++import {
++	createResetSalvage,
++	resetSalvageProviders,
++	startResetSalvage,
++} from "@oh-my-pi/pi-coding-agent/session/reset-salvage";
++import { TempDir } from "@oh-my-pi/pi-utils";
++
++const HOUR = 3_600_000;
++const DAY = 24 * HOUR;
++const EMAIL = "user@example.com";
++const ACCOUNT_ID = "acct-1";
++const CREDENTIAL_ID = 7;
++
++/** A Codex account whose week is mostly used, holding one saved reset. */
++function codexReport(weeklyUsed: number): UsageReport {
++	const now = Date.now();
++	const scope = { provider: "openai-codex", accountId: ACCOUNT_ID };
++	return {
++		provider: "openai-codex",
++		fetchedAt: now,
++		limits: [
++			{
++				id: "openai-codex:primary",
++				label: "5 Hour",
++				scope,
++				window: { id: "5h", label: "5 Hour", resetsAt: now + 2 * HOUR },
++				amount: { usedFraction: 0.1, unit: "percent" },
++			},
++			{
++				id: "openai-codex:secondary",
++				label: "Weekly",
++				scope,
++				window: { id: "7d", label: "Weekly", resetsAt: now + 3 * DAY },
++				amount: { usedFraction: weeklyUsed, unit: "percent" },
++			},
++		],
++		metadata: { accountId: ACCOUNT_ID, email: EMAIL },
++	};
++}
++
++function creditStatus(expiresInMs: number): ResetCreditAccountStatus {
++	return {
++		provider: "openai-codex",
++		credentialId: CREDENTIAL_ID,
++		accountId: ACCOUNT_ID,
++		email: EMAIL,
++		active: false,
++		availableCount: 1,
++		credits: [{ id: "credit-1", status: "available", expiresAt: new Date(Date.now() + expiresInMs).toISOString() }],
++	};
++}
++
++interface Fake {
++	storage: AuthStorage;
++	redeemed: ResetCreditTarget[];
++}
++
++function fakeStorage(
++	report: UsageReport,
++	status: ResetCreditAccountStatus,
++	outcome: ResetCreditRedeemOutcome = { ok: true, code: "reset", provider: "openai-codex" },
++): Fake {
++	const redeemed: ResetCreditTarget[] = [];
++	const storage = {
++		usage: { reports: async () => [report] },
++		resets: {
++			list: async ({ provider }: { provider?: string }) => (provider === status.provider ? [status] : []),
++			redeem: async ({ target }: { target: ResetCreditTarget }) => {
++				redeemed.push(target);
++				return outcome;
++			},
++		},
++		oauth: { accounts: () => [] },
++	} as unknown as AuthStorage;
++	return { storage, redeemed };
++}
++
++const consenting = (): Settings =>
++	Settings.isolated({ "codexResets.autoRedeem5h": "yes", "codexResets.autoRedeemWeekly": "yes" });
++
++describe("reset salvage", () => {
++	let tempDir: TempDir;
++	let coordinator: CodexAutoRedeemCoordinator;
++
++	beforeEach(() => {
++		tempDir = TempDir.createSync("@pi-reset-salvage-");
++		coordinator = createCodexAutoRedeemCoordinator();
++		coordinator.resetLockPath = `${tempDir.path()}/agent.db`;
++	});
++
++	afterEach(() => {
++		tempDir.removeSync();
++	});
++
++	it("spends a reset about to expire on a well-used window, once", async () => {
++		const fake = fakeStorage(codexReport(0.6), creditStatus(2 * HOUR));
++		const salvage = createResetSalvage({ storage: fake.storage, settings: consenting(), coordinator });
++
++		expect(await salvage.sweep()).toEqual([CREDENTIAL_ID]);
++		expect(fake.redeemed.map(target => target.credentialId)).toEqual([CREDENTIAL_ID]);
++		// The episode is spent: a later sweep does not spend it again.
++		expect(await salvage.sweep()).toEqual([]);
++		expect(fake.redeemed).toHaveLength(1);
++	});
++
++	it("leaves a reset with days to run", async () => {
++		const fake = fakeStorage(codexReport(0.6), creditStatus(2 * DAY));
++		const salvage = createResetSalvage({ storage: fake.storage, settings: consenting(), coordinator });
++
++		expect(await salvage.sweep()).toEqual([]);
++		expect(fake.redeemed).toHaveLength(0);
++	});
++
++	it("never spends without a `yes`, and starts nothing", async () => {
++		const fake = fakeStorage(codexReport(0.6), creditStatus(2 * HOUR));
++		const unset = Settings.isolated({});
++
++		expect(resetSalvageProviders(unset)).toEqual([]);
++		expect(startResetSalvage({ storage: fake.storage, settings: unset, coordinator })).toBeUndefined();
++		expect(await createResetSalvage({ storage: fake.storage, settings: unset, coordinator }).sweep()).toEqual([]);
++		expect(fake.redeemed).toHaveLength(0);
++		expect(resetSalvageProviders(consenting())).toEqual(["openai-codex"]);
++	});
++
++	it("defers a failure that may pass, rather than retrying at once", async () => {
++		const fake = fakeStorage(codexReport(0.6), creditStatus(2 * HOUR), {
++			ok: false,
++			code: "http_503",
++			provider: "openai-codex",
++		});
++		const salvage = createResetSalvage({ storage: fake.storage, settings: consenting(), coordinator });
++
++		expect(await salvage.sweep()).toEqual([]);
++		expect(await salvage.sweep()).toEqual([]);
++		expect(fake.redeemed).toHaveLength(1);
++		expect(coordinator.deferredUntilByKey.size).toBe(1);
++	});
++});
