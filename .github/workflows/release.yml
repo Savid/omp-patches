@@ -106,7 +106,6 @@ jobs:
             docker push --quiet "$IMAGE:$tag"
           done
           docker logout ghcr.io
-          scripts/pack.sh dist
           {
             echo "[omp $VERSION](https://github.com/can1357/oh-my-pi/releases/tag/v$VERSION) with:"
             echo
@@ -114,7 +113,7 @@ jobs:
             echo
             echo "Image: \`$IMAGE:${TAG#v}\`"
           } >notes.md
-          gh release create "$TAG" dist/*.tgz dist/SHA256SUMS --title "$TAG" --notes-file notes.md
+          gh release create "$TAG" --title "$TAG" --notes-file notes.md
           for issue in $(gh issue list --state open --search "\"Patches fail on omp\" in:title" --json number,title \
             -q ".[] | select(.title == \"Patches fail on omp $VERSION\") | .number"); do
             gh issue close "$issue" --comment "Released as $TAG."
