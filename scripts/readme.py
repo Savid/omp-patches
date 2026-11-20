@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""The patch list in README.md, written from the patches' own headers.
+"""The patch list in README.md and docs/series.svg, written from the patches' own headers.
 
-    scripts/readme.py           rewrite the list in README.md
-    scripts/readme.py --check   fail when README.md is out of date or a header is incomplete
+    scripts/readme.py           rewrite both
+    scripts/readme.py --check   fail when either is out of date or a header is incomplete
     scripts/readme.py --notes   print the list as release notes
 """
 
@@ -12,8 +12,11 @@ import pathlib
 import re
 import sys
 
+from diagram import render
+
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 README = ROOT / "README.md"
+DIAGRAM = ROOT / "docs" / "series.svg"
 START, END = "<!-- patches:start -->", "<!-- patches:end -->"
 STATUS = re.compile(r"^(Pending|(Submitted|Backport|Inappropriate|Denied) \[.+\])$")
 TRAILER = re.compile(r"^[A-Za-z][A-Za-z-]*: ")
@@ -34,8 +37,10 @@ def read(path: pathlib.Path) -> dict:
     description = "\n".join(body).strip()
     if not description:
         sys.exit(f"{path.name}: needs a description of what the patch does and why")
-    return {"file": path.name, "number": path.name[:4], "subject": subject, "status": status,
-            "description": description}
+    match = re.match(r"^\w+\(([^)]+)\): (.+)$", subject)
+    package, change = match.groups() if match else ("", subject)
+    return {"file": path.name, "number": path.name[:4], "subject": subject, "package": package,
+            "change": change, "status": status, "description": description}
 
 
 def patches() -> list:
@@ -45,9 +50,7 @@ def patches() -> list:
 def section(items: list) -> str:
     lines = [START, "", "| # | Package | Change | Upstream |", "|---|---|---|---|"]
     for p in items:
-        match = re.match(r"^\w+\(([^)]+)\): (.+)$", p["subject"])
-        package, change = match.groups() if match else ("", p["subject"])
-        lines.append(f"| {p['number']} | {package} | [{change}](patches/{p['file']}) | {p['status']} |")
+        lines.append(f"| {p['number']} | {p['package']} | [{p['change']}](patches/{p['file']}) | {p['status']} |")
     lines += ["", END]
     return "\n".join(lines)
 
@@ -62,11 +65,14 @@ def main() -> None:
         sys.exit(f"README.md needs the {START} and {END} markers")
     head, rest = text.split(START, 1)
     updated = head + section(items) + rest.split(END, 1)[1]
+    diagram = render(items)
     if "--check" in sys.argv:
-        if updated != text:
-            sys.exit("README.md's patch list is out of date: run scripts/readme.py")
+        if updated != text or not DIAGRAM.exists() or DIAGRAM.read_text() != diagram:
+            sys.exit("README.md or docs/series.svg is out of date: run scripts/readme.py")
         return
     README.write_text(updated)
+    DIAGRAM.parent.mkdir(exist_ok=True)
+    DIAGRAM.write_text(diagram)
 
 
 if __name__ == "__main__":

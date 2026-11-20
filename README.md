@@ -2,11 +2,7 @@
 
 [omp](https://github.com/can1357/oh-my-pi)'s auth broker and gateway, with a few patches on top.
 
-```mermaid
-flowchart LR
-  release["new omp release"] --> apply["apply patches/"] --> test["check + test"] --> image["ghcr.io/savid/omp"]
-  apply -. "a patch no longer applies" .-> issue["GitHub issue"]
-```
+![A new omp release, with the patch series applied in order, checked and tested, becomes the ghcr.io/savid/omp image](docs/series.svg)
 
 Every hour CI looks for a new omp release, applies the series to its tag, checks and tests every package it
 touches, and publishes `ghcr.io/savid/omp:<omp version>-r<n>` (also `:<omp version>` and `:latest`). The image is
@@ -52,7 +48,7 @@ codexResets: { autoRedeem5h: "yes", autoRedeemWeekly: "yes" }
 scripts/apply.sh    # omp at UPSTREAM in ./upstream, one commit per patch
                     # edit and commit there: the commit message is the patch header
 scripts/test.sh     # check and test what the series touches
-scripts/save.sh     # write the commits back to patches/ and this README
+scripts/save.sh     # write the commits back to patches/, this README and the diagram
 ```
 
 When a new omp breaks a patch, `scripts/apply.sh <version>` stops on it: resolve, `git -C upstream am --continue`,
