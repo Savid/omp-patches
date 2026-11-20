@@ -43,11 +43,11 @@ def patches() -> list:
 
 
 def section(items: list) -> str:
-    lines = [START, "", "| # | Patch | Upstream |", "|---|---|---|"]
+    lines = [START, "", "| # | Package | Change | Upstream |", "|---|---|---|---|"]
     for p in items:
-        lines.append(f"| {p['number']} | [{p['subject']}](patches/{p['file']}) | {p['status']} |")
-    for p in items:
-        lines += ["", f"### {p['number']} · {p['subject']}", "", p["description"]]
+        match = re.match(r"^\w+\(([^)]+)\): (.+)$", p["subject"])
+        package, change = match.groups() if match else ("", p["subject"])
+        lines.append(f"| {p['number']} | {package} | [{change}](patches/{p['file']}) | {p['status']} |")
     lines += ["", END]
     return "\n".join(lines)
 
@@ -55,7 +55,7 @@ def section(items: list) -> str:
 def main() -> None:
     items = patches()
     if "--notes" in sys.argv:
-        print("\n".join(f"- **{p['subject']}** ({p['status']})" for p in items))
+        print("\n".join(f"- {p['subject']}" for p in items))
         return
     text = README.read_text()
     if START not in text or END not in text:
