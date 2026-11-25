@@ -29,7 +29,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 packages/ai/test/anthropic-message-thread-anchors.test.ts
 
 diff --git a/packages/ai/src/providers/anthropic-threads.ts b/packages/ai/src/providers/anthropic-threads.ts
-index 2274f42578..1f79e56457 100644
+index 2274f425..1f79e564 100644
 --- a/packages/ai/src/providers/anthropic-threads.ts
 +++ b/packages/ai/src/providers/anthropic-threads.ts
 @@ -91,8 +91,14 @@ export interface AnthropicThreadChain {
@@ -166,7 +166,7 @@ index 2274f42578..1f79e56457 100644
  /**
 diff --git a/packages/ai/test/anthropic-message-thread-anchors.test.ts b/packages/ai/test/anthropic-message-thread-anchors.test.ts
 new file mode 100644
-index 0000000000..6b2f1ab76e
+index 00000000..6b2f1ab7
 --- /dev/null
 +++ b/packages/ai/test/anthropic-message-thread-anchors.test.ts
 @@ -0,0 +1,118 @@

@@ -1,0 +1,264 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Davis <1709934+Savid@users.noreply.github.com>
+Date: Wed, 25 Nov 2026 12:44:42 +0000
+Subject: [PATCH] fix(ai): keep caching when a client leaves out older thinking
+
+Anthropic lets a request leave out the oldest thinking blocks, as long as it
+keeps them out, and a client that keeps only the newest assistant turn's
+thinking does exactly that on every request. Each block it leaves out
+changes every prefix after it. The rolling breakpoints sit on the tail and
+on the newest assistant turn, both after the thinking the next request
+leaves out, so no entry they write is ever read again: each request writes
+its whole history past the head to the cache.
+
+Through the auth gateway, a 30-step Claude Haiku 5.5 tool loop that kept
+only the newest thinking read 14.4k tokens a step from the cache and wrote
+15.5k, against 31.7k read and 475 written when it kept every block. From
+step 14 on, 13 of 17 requests read nothing past the head.
+
+When a request holds thinking in exactly one assistant turn, with an earlier
+assistant turn holding none, the second message breakpoint now goes on the
+message before that turn: the last one whose prefix the next request
+repeats. It takes priority over decimation, the per-call mark and the second
+trailing message. Requests without thinking, or with thinking in more than
+one turn, are anchored as before. A conversation that keeps every block takes
+the new shape only while its model has thought once, and the anchor then
+falls on a message an earlier request already anchored as its tail.
+
+Upstream-Status: Pending
+Amp-Thread-ID: https://ampcode.com/threads/T-01a21294-5968-75ff-96f8-d8cf54ca52a8
+---
+ packages/ai/src/providers/anthropic.ts        |  58 +++++++-
+ ...nthropic-left-out-thinking-caching.test.ts | 138 ++++++++++++++++++
+ 2 files changed, 193 insertions(+), 3 deletions(-)
+ create mode 100644 packages/ai/test/anthropic-left-out-thinking-caching.test.ts
+
+diff --git a/packages/ai/src/providers/anthropic.ts b/packages/ai/src/providers/anthropic.ts
+index 52f76a05..6e2c0595 100644
+--- a/packages/ai/src/providers/anthropic.ts
++++ b/packages/ai/src/providers/anthropic.ts
+@@ -4513,6 +4513,49 @@ function applyCacheControlToMessage(message: MessageParam, cacheControl: Anthrop
+ 	return false;
+ }
+ 
++/**
++ * The message to anchor when a request keeps thinking only in its newest
++ * thinking assistant turn and leaves it out of the turns before, or -1.
++ *
++ * A client may leave out the oldest thinking blocks, as long as it keeps them
++ * out. Each one left out changes every prefix after it, so the next request,
++ * which leaves out this turn's thinking too, repeats neither the tail nor the
++ * newest assistant turn where the rolling anchors sit, and reads nothing past
++ * the head. The message before the newest turn that keeps thinking is the last
++ * one whose prefix the next request repeats.
++ *
++ * Such a request holds thinking in exactly one assistant turn, with an earlier
++ * assistant turn holding none. A conversation that keeps every block takes
++ * that shape only while one turn has thought, and the anchor then falls on a
++ * message an earlier request already anchored as its tail.
++ */
++function leftOutThinkingAnchor(messages: readonly MessageParam[], end: number): number {
++	let kept = -1;
++	let leftOut = false;
++	for (let index = end; index >= 0; index--) {
++		const message = messages[index];
++		if (message?.role !== "assistant") continue;
++		const thinks =
++			Array.isArray(message.content) &&
++			message.content.some(block => block.type === "thinking" || block.type === "redacted_thinking");
++		if (!thinks) {
++			if (kept !== -1) leftOut = true;
++		} else if (kept === -1) {
++			kept = index;
++		} else {
++			return -1;
++		}
++	}
++	if (!leftOut) return -1;
++	for (let index = kept - 1; index >= 0; index--) {
++		const message = messages[index];
++		if (!message || isToolControlMessage(message)) continue;
++		if (message.clear_at === "next_user_message" || isPerCallContextMessage(message)) continue;
++		return index;
++	}
++	return -1;
++}
++
+ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?: AnthropicCacheControl): void {
+ 	if (!cacheControl) return;
+ 
+@@ -4598,11 +4641,13 @@ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?:
+ 	//
+ 	// Priority order:
+ 	// 1. Most recent trailing message
+-	// 2. Latest decimation checkpoints (newest first) to maintain stable long-context anchors
+-	// 3. Newest message at or before the first per-call/turn-scoped mark, so a
++	// 2. The message before the newest assistant turn that keeps its thinking,
++	//    when older turns' thinking is left out (see `leftOutThinkingAnchor`)
++	// 3. Latest decimation checkpoints (newest first) to maintain stable long-context anchors
++	// 4. Newest message at or before the first per-call/turn-scoped mark, so a
+ 	//    volatile interior message costs only its own re-billed bytes instead
+ 	//    of invalidating the whole reusable prefix behind it
+-	// 4. Second trailing message
++	// 5. Second trailing message
+ 	//
+ 	// Count only successful block decorations toward the message budget so an uncacheable
+ 	// block (such as a thinking-only assistant) does not silently consume a breakpoint.
+@@ -4613,6 +4658,13 @@ function applyPromptCaching(params: MessageCreateParamsStreaming, cacheControl?:
+ 			appliedCount++;
+ 		}
+ 	}
++	const thinkingAnchor = leftOutThinkingAnchor(params.messages, messageEnd);
++	if (thinkingAnchor !== -1 && appliedCount < messageBudget) {
++		const message = params.messages[thinkingAnchor];
++		if (message && applyCacheControlToMessage(message, cacheControl)) {
++			appliedCount++;
++		}
++	}
+ 	// Stable historical decimation checkpoint every 15 user turns (15th, 30th, 45th...)
+ 	if (stableUserTurns >= ANTHROPIC_DECIMATION_INTERVAL) {
+ 		let turnsSinceCheckpoint = stableUserTurns % ANTHROPIC_DECIMATION_INTERVAL;
+diff --git a/packages/ai/test/anthropic-left-out-thinking-caching.test.ts b/packages/ai/test/anthropic-left-out-thinking-caching.test.ts
+new file mode 100644
+index 00000000..5af25e97
+--- /dev/null
++++ b/packages/ai/test/anthropic-left-out-thinking-caching.test.ts
+@@ -0,0 +1,138 @@
++/**
++ * Unit test: a client may leave out older assistant turns' thinking and keep
++ * only the newest turn's. Each block it leaves out changes every prefix after
++ * it, so a request must anchor a cache breakpoint on a prefix the next request
++ * repeats, or that request reads nothing past the head.
++ *
++ * No network: a capturing `fetch` records the serialized wire body and returns
++ * a 400 so the request short-circuits.
++ */
++import { describe, expect, it } from "bun:test";
++import { streamAnthropic } from "@oh-my-pi/pi-ai/providers/anthropic";
++import type { MessageCreateParams } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
++import type { AssistantMessage, Context, Message, Model, ModelSpec } from "@oh-my-pi/pi-ai/types";
++import { requestBodyText } from "@oh-my-pi/pi-ai/utils/request-body";
++import { buildModel } from "@oh-my-pi/pi-catalog/build";
++
++const MODEL_SPEC: ModelSpec<"anthropic-messages"> = {
++	id: "claude-sonnet-4-5",
++	name: "Claude Sonnet 4.5",
++	api: "anthropic-messages",
++	provider: "anthropic",
++	baseUrl: "https://api.anthropic.com",
++	reasoning: true,
++	input: ["text"],
++	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++	contextWindow: 200_000,
++	maxTokens: 8_192,
++};
++
++const MODEL: Model<"anthropic-messages"> = buildModel(MODEL_SPEC);
++
++const TOOLS: Context["tools"] = [
++	{
++		name: "move",
++		description: "Move the hero",
++		parameters: { type: "object", properties: {}, additionalProperties: false },
++	},
++];
++
++async function captureWireBody(messages: Message[]): Promise<MessageCreateParams> {
++	let body: MessageCreateParams | undefined;
++	const fetchMock = (async (_input: string | URL | Request, init?: RequestInit) => {
++		body = JSON.parse(requestBodyText(init) ?? "{}") as MessageCreateParams;
++		return new Response(
++			JSON.stringify({ type: "error", error: { type: "invalid_request_error", message: "captured" } }),
++			{ status: 400, headers: { "Content-Type": "application/json" } },
++		);
++	}) as typeof fetch;
++
++	await streamAnthropic(
++		MODEL,
++		{ systemPrompt: ["Play the game."], messages, tools: TOOLS },
++		{ apiKey: "sk-ant-api-test", fetch: fetchMock },
++	)
++		.result()
++		.catch(() => undefined);
++
++	if (!body) throw new Error("wire body was not captured");
++	return body;
++}
++
++/** One step of a tool loop: the assistant turn, with or without its thinking, and its tool result. */
++function step(n: number, thinking: boolean): Message[] {
++	const assistant: AssistantMessage = {
++		role: "assistant",
++		content: [
++			...(thinking ? [{ type: "thinking" as const, thinking: `plan ${n}`, thinkingSignature: `sig-${n}` }] : []),
++			{ type: "toolCall", id: `toolu_${n}`, name: "move", arguments: {} },
++		],
++		api: "anthropic-messages",
++		provider: "anthropic",
++		model: MODEL_SPEC.id,
++		usage: {
++			input: 1,
++			output: 1,
++			cacheRead: 0,
++			cacheWrite: 0,
++			totalTokens: 2,
++			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++		},
++		stopReason: "toolUse",
++		timestamp: n * 2 + 1,
++	};
++	return [
++		assistant,
++		{
++			role: "toolResult",
++			toolCallId: `toolu_${n}`,
++			toolName: "move",
++			content: [{ type: "text", text: `screen ${n}` }],
++			isError: false,
++			timestamp: n * 2 + 2,
++		},
++	];
++}
++
++/** A tool loop of `steps` steps, keeping thinking in the steps `kept` names. */
++function loop(steps: number, kept: (n: number) => boolean): Message[] {
++	const messages: Message[] = [{ role: "user", content: "Reach the stairs.", timestamp: 1 }];
++	for (let n = 1; n <= steps; n++) messages.push(...step(n, kept(n)));
++	return messages;
++}
++
++function cachedMessageIndices(body: MessageCreateParams): number[] {
++	return (body.messages ?? []).flatMap((message, index) =>
++		Array.isArray(message.content) &&
++		message.content.some(block => (block as { cache_control?: unknown }).cache_control != null)
++			? [index]
++			: [],
++	);
++}
++
++/** The wire messages up to and including `end`, as the cache hashes them: without breakpoints. */
++function prefix(body: MessageCreateParams, end: number): string {
++	return JSON.stringify(body.messages.slice(0, end + 1), (key, value) =>
++		key === "cache_control" ? undefined : value,
++	);
++}
++
++describe("anthropic prompt caching when older thinking is left out", () => {
++	it("anchors a prefix the next request repeats once it leaves this turn's thinking out too", async () => {
++		const now = await captureWireBody(loop(3, n => n === 3));
++		const next = await captureWireBody(loop(4, n => n === 4));
++
++		const tail = now.messages.length - 1;
++		const anchors = cachedMessageIndices(now).filter(index => index !== tail);
++		expect(anchors).toHaveLength(1);
++		// The message before the turn that keeps its thinking: the second step's tool result.
++		expect(anchors[0]).toBe(tail - 2);
++		expect(prefix(next, anchors[0])).toBe(prefix(now, anchors[0]));
++	});
++
++	it("keeps the second trailing anchor when every turn keeps its thinking", async () => {
++		const body = await captureWireBody(loop(3, () => true));
++		const tail = body.messages.length - 1;
++		expect(cachedMessageIndices(body)).toEqual([tail - 1, tail]);
++	});
++});

@@ -31,7 +31,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 packages/coding-agent/test/reset-salvage.test.ts
 
 diff --git a/packages/coding-agent/src/cli/auth-gateway-cli.ts b/packages/coding-agent/src/cli/auth-gateway-cli.ts
-index d129a8cc36..fcee55a1b4 100644
+index d129a8cc..fcee55a1 100644
 --- a/packages/coding-agent/src/cli/auth-gateway-cli.ts
 +++ b/packages/coding-agent/src/cli/auth-gateway-cli.ts
 @@ -56,6 +56,7 @@ import {
@@ -66,7 +66,7 @@ index d129a8cc36..fcee55a1b4 100644
  			await handle.close();
 diff --git a/packages/coding-agent/src/session/reset-salvage.ts b/packages/coding-agent/src/session/reset-salvage.ts
 new file mode 100644
-index 0000000000..b8a45c36e7
+index 00000000..b8a45c36
 --- /dev/null
 +++ b/packages/coding-agent/src/session/reset-salvage.ts
 @@ -0,0 +1,222 @@
@@ -294,7 +294,7 @@ index 0000000000..b8a45c36e7
 +}
 diff --git a/packages/coding-agent/test/reset-salvage.test.ts b/packages/coding-agent/test/reset-salvage.test.ts
 new file mode 100644
-index 0000000000..f827d18a54
+index 00000000..f827d18a
 --- /dev/null
 +++ b/packages/coding-agent/test/reset-salvage.test.ts
 @@ -0,0 +1,151 @@
