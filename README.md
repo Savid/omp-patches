@@ -25,6 +25,7 @@ Each patch's header says what it changes and why. Upstream status is `Pending` (
 | 0006 | ai | [drain accounts whose saved reset is about to lapse](patches/0006-feat-ai-drain-accounts-whose-saved-reset-is-about-to.patch) | Pending |
 | 0007 | coding-agent | [auth gateway spends saved resets before they expire](patches/0007-feat-coding-agent-auth-gateway-spends-saved-resets-b.patch) | Pending |
 | 0008 | ai | [keep caching when a client leaves out older thinking](patches/0008-fix-ai-keep-caching-when-a-client-leaves-out-older-t.patch) | Pending |
+| 0009 | ai | [auth gateway logs why a conversation's message thread starts over](patches/0009-feat-ai-auth-gateway-logs-why-a-conversation-s-messa.patch) | Pending |
 
 <!-- patches:end -->
 
