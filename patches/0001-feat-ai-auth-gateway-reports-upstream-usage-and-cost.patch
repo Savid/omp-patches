@@ -31,7 +31,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 packages/ai/test/auth-gateway-usage-reporting.test.ts
 
 diff --git a/packages/ai/src/providers/anthropic-messages-server.ts b/packages/ai/src/providers/anthropic-messages-server.ts
-index f81b9fb903..6802c6b8a7 100644
+index f81b9fb9..6802c6b8 100644
 --- a/packages/ai/src/providers/anthropic-messages-server.ts
 +++ b/packages/ai/src/providers/anthropic-messages-server.ts
 @@ -31,6 +31,7 @@ import {
@@ -91,10 +91,10 @@ index f81b9fb903..6802c6b8a7 100644
  }
  
 diff --git a/packages/ai/src/providers/anthropic.ts b/packages/ai/src/providers/anthropic.ts
-index 7d6715454e..6749cb7d3f 100644
+index 27c68420..52f76a05 100644
 --- a/packages/ai/src/providers/anthropic.ts
 +++ b/packages/ai/src/providers/anthropic.ts
-@@ -2931,6 +2931,7 @@ const streamAnthropicOnce = (
+@@ -2964,6 +2964,7 @@ const streamAnthropicOnce = (
  								output.usage.output = startUsage.output_tokens || 0;
  								output.usage.cacheRead = startUsage.cache_read_input_tokens || 0;
  								output.usage.cacheWrite = startUsage.cache_creation_input_tokens || 0;
@@ -102,7 +102,7 @@ index 7d6715454e..6749cb7d3f 100644
  								const compacted = applyCompactionIterationUsage(output.usage, startUsage);
  								output.usage.totalTokens =
  									output.usage.input + output.usage.output + output.usage.cacheRead + output.usage.cacheWrite;
-@@ -3301,6 +3302,7 @@ const streamAnthropicOnce = (
+@@ -3334,6 +3335,7 @@ const streamAnthropicOnce = (
  								}
  								if (deltaUsage.cache_creation_input_tokens != null) {
  									output.usage.cacheWrite = deltaUsage.cache_creation_input_tokens;
@@ -111,7 +111,7 @@ index 7d6715454e..6749cb7d3f 100644
  								applyAnthropicUsageExtras(output.usage, deltaUsage);
  								const compacted = applyCompactionIterationUsage(output.usage, deltaUsage);
 diff --git a/packages/ai/src/providers/openai-chat-server-schema.ts b/packages/ai/src/providers/openai-chat-server-schema.ts
-index 79bd7100a0..4bc65ea916 100644
+index 79bd7100..4bc65ea9 100644
 --- a/packages/ai/src/providers/openai-chat-server-schema.ts
 +++ b/packages/ai/src/providers/openai-chat-server-schema.ts
 @@ -140,6 +140,9 @@ export const assistantMessageSchema = type({
@@ -125,7 +125,7 @@ index 79bd7100a0..4bc65ea916 100644
  
  export const toolMessageSchema = type({
 diff --git a/packages/ai/src/providers/openai-chat-server.ts b/packages/ai/src/providers/openai-chat-server.ts
-index 8c93ba5082..6d1db0a475 100644
+index 4316b768..daabff56 100644
 --- a/packages/ai/src/providers/openai-chat-server.ts
 +++ b/packages/ai/src/providers/openai-chat-server.ts
 @@ -19,8 +19,10 @@ import type {
@@ -139,7 +139,7 @@ index 8c93ba5082..6d1db0a475 100644
  	Tool,
  	ToolCall,
  	ToolResultMessage,
-@@ -34,16 +36,26 @@ import {
+@@ -34,6 +36,7 @@ import {
  	type OpenAIChatToolChoice,
  	openaiChatRequestSchema,
  } from "./openai-chat-server-schema";
@@ -147,6 +147,7 @@ index 8c93ba5082..6d1db0a475 100644
  import { decodeDataUri } from "./openai-data-uri";
  import {
  	geminiToolCallExtraContent,
+@@ -41,10 +44,19 @@ import {
  	rawGeminiToolCallSignature,
  	storeGeminiToolCallSignature,
  } from "./openai-completions";
@@ -167,7 +168,7 @@ index 8c93ba5082..6d1db0a475 100644
  const UNSUPPORTED_EXPLICIT_PROMPT_CACHE_MESSAGE =
  	"openai-chat: prompt_cache_options and prompt_cache_breakpoint are unsupported by this auth-gateway route; use /v1/pi/stream with options.promptCache instead";
  
-@@ -130,6 +142,7 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
+@@ -131,6 +143,7 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
  						(m.content ?? undefined) as string | OpenAIChatContentPart[] | undefined,
  						m.tool_calls,
  						(m as { reasoning_content?: string | null }).reasoning_content ?? undefined,
@@ -175,7 +176,7 @@ index 8c93ba5082..6d1db0a475 100644
  						data.model,
  						now,
  					),
-@@ -253,15 +266,45 @@ function parseUserLikeContent(
+@@ -254,15 +267,45 @@ function parseUserLikeContent(
  	return parts;
  }
  
@@ -222,7 +223,7 @@ index 8c93ba5082..6d1db0a475 100644
  		// Replayed reasoning channel. The signature names the wire field so
  		// completions providers that demand exact `reasoning_content` replay
  		// (DeepSeek/Kimi) echo the model's actual reasoning back verbatim.
-@@ -298,7 +341,7 @@ function buildAssistantMessage(
+@@ -299,7 +342,7 @@ function buildAssistantMessage(
  			parts.push(call);
  		}
  	}
@@ -231,7 +232,7 @@ index 8c93ba5082..6d1db0a475 100644
  		role: "assistant",
  		content: parts,
  		api: "openai-completions",
-@@ -315,6 +358,18 @@ function buildAssistantMessage(
+@@ -316,6 +359,18 @@ function buildAssistantMessage(
  		stopReason: "stop",
  		timestamp: now,
  	};
@@ -250,7 +251,7 @@ index 8c93ba5082..6d1db0a475 100644
  }
  
  /**
-@@ -453,6 +508,8 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
+@@ -454,6 +509,8 @@ export function encodeResponse(message: AssistantMessage, requestedModelId: stri
  		// DeepSeek-style / o-series reasoning channel.
  		responseMessage.reasoning_content = reasoning;
  	}
@@ -259,7 +260,7 @@ index 8c93ba5082..6d1db0a475 100644
  	if (toolCalls.length > 0) {
  		responseMessage.tool_calls = toolCalls.map(tc => {
  			const extraContent = geminiToolCallExtraContent(tc.thoughtSignature);
-@@ -491,11 +548,30 @@ function buildUsage(message: AssistantMessage): Record<string, unknown> {
+@@ -497,11 +554,30 @@ function buildUsage(message: AssistantMessage): Record<string, unknown> {
  		prompt_tokens: promptTokens,
  		completion_tokens: message.usage.output,
  		total_tokens: promptTokens + message.usage.output,
@@ -291,7 +292,7 @@ index 8c93ba5082..6d1db0a475 100644
  	return usage;
  }
  
-@@ -528,6 +604,34 @@ function flattenAssistant(message: AssistantMessage): {
+@@ -534,6 +610,34 @@ function flattenAssistant(message: AssistantMessage): {
  	return { text, reasoning, toolCalls };
  }
  
@@ -326,7 +327,7 @@ index 8c93ba5082..6d1db0a475 100644
  function isOnlyRaw(args: Record<string, unknown>): boolean {
  	for (const k in args) {
  		if (k !== "__raw") return false;
-@@ -767,7 +871,7 @@ export function encodeStream(
+@@ -794,7 +898,7 @@ export function encodeStream(
  							break;
  						}
  
@@ -335,7 +336,7 @@ index 8c93ba5082..6d1db0a475 100644
  							finishReason =
  								event.reason === "toolUse"
  									? "tool_calls"
-@@ -776,11 +880,18 @@ export function encodeStream(
+@@ -803,11 +907,18 @@ export function encodeStream(
  										: hasToolCalls
  											? "tool_calls"
  											: "stop";
@@ -355,7 +356,7 @@ index 8c93ba5082..6d1db0a475 100644
  						case "error": {
  							const msg = event.error.errorMessage ?? "stream error";
 diff --git a/packages/ai/src/providers/openai-responses-server.ts b/packages/ai/src/providers/openai-responses-server.ts
-index f49478b66c..c99bd8577f 100644
+index f49478b6..c99bd857 100644
 --- a/packages/ai/src/providers/openai-responses-server.ts
 +++ b/packages/ai/src/providers/openai-responses-server.ts
 @@ -51,6 +51,7 @@ import {
@@ -402,10 +403,10 @@ index f49478b66c..c99bd8577f 100644
  }
  
 diff --git a/packages/ai/src/providers/openai-shared.ts b/packages/ai/src/providers/openai-shared.ts
-index a21b277056..df31fa03e6 100644
+index 0ca196a1..2d542e1c 100644
 --- a/packages/ai/src/providers/openai-shared.ts
 +++ b/packages/ai/src/providers/openai-shared.ts
-@@ -478,7 +478,8 @@ export function applyProviderReportedCost(model: Pick<Model, "provider">, usage:
+@@ -490,7 +490,8 @@ export function applyProviderReportedCost(model: Pick<Model, "provider">, usage:
  	// carries the provider spend. Both are real charges, so add them (verified
  	// live 2026-10-02: openrouter/openai/gpt-6.1-sol returned `cost: 0,
  	// is_byok: true, cost_details.upstream_inference_cost: 6.6e-05`).
@@ -415,7 +416,7 @@ index a21b277056..df31fa03e6 100644
  		const details = Reflect.get(rawUsage, "cost_details");
  		const upstreamCost =
  			typeof details === "object" && details !== null ? Reflect.get(details, "upstream_inference_cost") : undefined;
-@@ -486,6 +487,7 @@ export function applyProviderReportedCost(model: Pick<Model, "provider">, usage:
+@@ -498,6 +499,7 @@ export function applyProviderReportedCost(model: Pick<Model, "provider">, usage:
  			const creditsCharge =
  				typeof reportedCost === "number" && Number.isFinite(reportedCost) && reportedCost >= 0 ? reportedCost : 0;
  			reportedCost = creditsCharge + upstreamCost;
@@ -423,7 +424,7 @@ index a21b277056..df31fa03e6 100644
  		}
  	}
  	if (typeof reportedCost !== "number" || !Number.isFinite(reportedCost) || reportedCost < 0) return;
-@@ -505,6 +507,16 @@ export function applyProviderReportedCost(model: Pick<Model, "provider">, usage:
+@@ -517,6 +519,16 @@ export function applyProviderReportedCost(model: Pick<Model, "provider">, usage:
  		usage.cost.cacheWrite = 0;
  	}
  	usage.cost.total = reportedCost;
@@ -440,7 +441,7 @@ index a21b277056..df31fa03e6 100644
  }
  
  export interface OpenAIUsageAccountingInput {
-@@ -524,6 +536,7 @@ export interface OpenAIUsageAccounting {
+@@ -536,6 +548,7 @@ export interface OpenAIUsageAccounting {
  	cacheWrite: number;
  	totalTokens: number;
  	reasoningTokens?: number;
@@ -448,7 +449,7 @@ index a21b277056..df31fa03e6 100644
  	orchestration?: Usage["orchestration"];
  }
  
-@@ -544,6 +557,7 @@ export function calculateOpenAIUsageAccounting(accounting: OpenAIUsageAccounting
+@@ -556,6 +569,7 @@ export function calculateOpenAIUsageAccounting(accounting: OpenAIUsageAccounting
  		cacheWrite,
  		totalTokens: input + accounting.outputTokens + accounting.cachedTokens + cacheWrite,
  		...(accounting.reasoningTokens > 0 ? { reasoningTokens: accounting.reasoningTokens } : {}),
@@ -457,7 +458,7 @@ index a21b277056..df31fa03e6 100644
  }
  
 diff --git a/packages/ai/src/utils/openrouter-headers.ts b/packages/ai/src/utils/openrouter-headers.ts
-index de5bd4f373..2c35cbe55c 100644
+index de5bd4f3..2c35cbe5 100644
 --- a/packages/ai/src/utils/openrouter-headers.ts
 +++ b/packages/ai/src/utils/openrouter-headers.ts
 @@ -6,7 +6,5 @@ export function getOpenRouterHeaders(): Record<string, string> {
@@ -469,7 +470,7 @@ index de5bd4f373..2c35cbe55c 100644
  	};
  }
 diff --git a/packages/ai/test/auth-gateway-anthropic-messages.test.ts b/packages/ai/test/auth-gateway-anthropic-messages.test.ts
-index 7adfb61749..ea4cc0a0c6 100644
+index 7adfb617..ea4cc0a0 100644
 --- a/packages/ai/test/auth-gateway-anthropic-messages.test.ts
 +++ b/packages/ai/test/auth-gateway-anthropic-messages.test.ts
 @@ -129,7 +129,9 @@ describe("anthropic-messages parseRequest", () => {
@@ -484,10 +485,10 @@ index 7adfb61749..ea4cc0a0c6 100644
  		expect(parsed.options.temperature).toBe(0.2);
  		expect(parsed.options.topP).toBe(0.9);
 diff --git a/packages/ai/test/auth-gateway-openai-chat.test.ts b/packages/ai/test/auth-gateway-openai-chat.test.ts
-index b9fe3623b4..80893ac713 100644
+index 85839a30..9cbf1738 100644
 --- a/packages/ai/test/auth-gateway-openai-chat.test.ts
 +++ b/packages/ai/test/auth-gateway-openai-chat.test.ts
-@@ -414,7 +414,8 @@ describe("auth-gateway openai-chat: encodeResponse", () => {
+@@ -450,7 +450,8 @@ describe("auth-gateway openai-chat: encodeResponse", () => {
  
  		expect(out.usage).toEqual({
  			prompt_tokens: 20,
@@ -498,7 +499,7 @@ index b9fe3623b4..80893ac713 100644
  			total_tokens: 40,
  		});
 diff --git a/packages/ai/test/auth-gateway-openai-responses.test.ts b/packages/ai/test/auth-gateway-openai-responses.test.ts
-index b3b8e8ff37..4b9a8a0a63 100644
+index b3b8e8ff..4b9a8a0a 100644
 --- a/packages/ai/test/auth-gateway-openai-responses.test.ts
 +++ b/packages/ai/test/auth-gateway-openai-responses.test.ts
 @@ -1020,7 +1020,8 @@ describe("openai-responses encodeResponse", () => {
@@ -513,7 +514,7 @@ index b3b8e8ff37..4b9a8a0a63 100644
  			total_tokens: 40,
 diff --git a/packages/ai/test/auth-gateway-usage-reporting.test.ts b/packages/ai/test/auth-gateway-usage-reporting.test.ts
 new file mode 100644
-index 0000000000..ab978a4fda
+index 00000000..ab978a4f
 --- /dev/null
 +++ b/packages/ai/test/auth-gateway-usage-reporting.test.ts
 @@ -0,0 +1,196 @@
@@ -714,7 +715,7 @@ index 0000000000..ab978a4fda
 +	});
 +});
 diff --git a/packages/catalog/src/types.ts b/packages/catalog/src/types.ts
-index d38bca0e09..8599b0b60e 100644
+index 148e8ba5..bf08a1ce 100644
 --- a/packages/catalog/src/types.ts
 +++ b/packages/catalog/src/types.ts
 @@ -274,6 +274,21 @@ export interface Usage {
@@ -740,7 +741,7 @@ index d38bca0e09..8599b0b60e 100644
  		input: number;
  		output: number;
 diff --git a/packages/coding-agent/src/modes/rpc/wire/content.ts b/packages/coding-agent/src/modes/rpc/wire/content.ts
-index 6c25684acd..9d93117f9c 100644
+index 6c25684a..9d93117f 100644
 --- a/packages/coding-agent/src/modes/rpc/wire/content.ts
 +++ b/packages/coding-agent/src/modes/rpc/wire/content.ts
 @@ -77,6 +77,9 @@ export const messageDefs = {
@@ -754,7 +755,7 @@ index 6c25684acd..9d93117f9c 100644
  		"cttl?": JSON_OBJECT,
  		"server?": JSON_OBJECT,
 diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
-index 4cbb84f762..311e953dc6 100644
+index 37e163cf..dd5befbe 100644
 --- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
 +++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
 @@ -85,6 +85,9 @@ export interface Usage {
@@ -768,10 +769,10 @@ index 4cbb84f762..311e953dc6 100644
  	cttl?: Record<string, unknown>;
  	server?: Record<string, unknown>;
 diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
-index 319ffc091f..d71e4ed141 100644
+index 6eea90de..407b7831 100644
 --- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
 +++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
-@@ -1139,6 +1139,15 @@
+@@ -1172,6 +1172,15 @@
  				"reasoningTokens": {
  					"type": "integer"
  				},
@@ -788,4 +789,4 @@ index 319ffc091f..d71e4ed141 100644
  					"type": "object",
  					"properties": {},
 
-base-commit: f40f335845f0b136453d12fec8d6057011082766
+base-commit: 5c5ecb16fa4903c09a57a84983e482d9c9c2232e

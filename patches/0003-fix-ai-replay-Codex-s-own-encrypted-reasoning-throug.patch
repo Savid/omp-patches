@@ -35,7 +35,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 229 insertions(+), 40 deletions(-)
 
 diff --git a/packages/ai/src/providers/openai-responses-server.ts b/packages/ai/src/providers/openai-responses-server.ts
-index c99bd8577f..d40cf4b10d 100644
+index c99bd857..d40cf4b1 100644
 --- a/packages/ai/src/providers/openai-responses-server.ts
 +++ b/packages/ai/src/providers/openai-responses-server.ts
 @@ -577,6 +577,14 @@ export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
@@ -90,10 +90,10 @@ index c99bd8577f..d40cf4b10d 100644
  								item_id: cur.itemId,
  								output_index: cur.outputIndex,
 diff --git a/packages/ai/src/providers/transform-messages.ts b/packages/ai/src/providers/transform-messages.ts
-index fac1ceb34c..177c17fd62 100644
+index 5770193e..d1786497 100644
 --- a/packages/ai/src/providers/transform-messages.ts
 +++ b/packages/ai/src/providers/transform-messages.ts
-@@ -667,6 +667,25 @@ function targetReplaysPlaintextReasoning(model: Model, compat: Model["compat"]):
+@@ -668,6 +668,25 @@ function targetReplaysPlaintextReasoning(model: Model, compat: Model["compat"]):
  	}
  }
  
@@ -119,7 +119,7 @@ index fac1ceb34c..177c17fd62 100644
  function fallbackAnthropicToolCallId(originalId: string): string {
  	return `toolu_${Bun.hash(originalId).toString(36)}`;
  }
-@@ -993,6 +1012,11 @@ export function transformMessages<TApi extends Api>(
+@@ -1003,6 +1022,11 @@ export function transformMessages<TApi extends Api>(
  					},
  					model,
  				);
@@ -131,7 +131,7 @@ index fac1ceb34c..177c17fd62 100644
  
  			const isAnthropicTarget = isAnthropicMessagesModel(model);
  			// Anthropic's all-or-none contract on prior-turn thinking blocks
-@@ -1180,6 +1204,18 @@ export function transformMessages<TApi extends Api>(
+@@ -1190,6 +1214,18 @@ export function transformMessages<TApi extends Api>(
  					// (the encoder needs them for native replay; an OpenAI encrypted
  					// reasoning blob has empty text but a load-bearing signature).
  					if (isSameModel && sanitized.thinkingSignature) return sanitized;
@@ -150,7 +150,7 @@ index fac1ceb34c..177c17fd62 100644
  					// Nothing left for the next turn to replay: drop empty/no-anchor
  					// thinking blocks before the cross-model paths.
  					if (!sanitized.thinking || sanitized.thinking.trim() === "") return [];
-@@ -1201,14 +1237,19 @@ export function transformMessages<TApi extends Api>(
+@@ -1211,14 +1247,19 @@ export function transformMessages<TApi extends Api>(
  					if (carriesSameModelReasoning && sanitized.summary === false) {
  						return { type: "thinking" as const, thinking: sanitized.thinking, [kCarriedReasoning]: true };
  					}
@@ -178,7 +178,7 @@ index fac1ceb34c..177c17fd62 100644
  					// thought parts, anthropic-target from a non-Anthropic source, or any
  					// reasoning-disabled target) can't replay an unsigned thinking block:
 diff --git a/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts b/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
-index 101f12e68e..66c56a5bb1 100644
+index 101f12e6..66c56a5b 100644
 --- a/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
 +++ b/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
 @@ -1,23 +1,35 @@

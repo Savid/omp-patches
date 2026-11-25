@@ -24,10 +24,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
 
 diff --git a/packages/ai/src/providers/transform-messages.ts b/packages/ai/src/providers/transform-messages.ts
-index ac8ca1254a..fac1ceb34c 100644
+index 1ea29f08..5770193e 100644
 --- a/packages/ai/src/providers/transform-messages.ts
 +++ b/packages/ai/src/providers/transform-messages.ts
-@@ -1201,6 +1201,14 @@ export function transformMessages<TApi extends Api>(
+@@ -1211,6 +1211,14 @@ export function transformMessages<TApi extends Api>(
  					if (carriesSameModelReasoning && sanitized.summary === false) {
  						return { type: "thinking" as const, thinking: sanitized.thinking, [kCarriedReasoning]: true };
  					}
@@ -44,7 +44,7 @@ index ac8ca1254a..fac1ceb34c 100644
  					// reasoning-disabled target) can't replay an unsigned thinking block:
 diff --git a/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts b/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
 new file mode 100644
-index 0000000000..101f12e68e
+index 00000000..101f12e6
 --- /dev/null
 +++ b/packages/ai/test/auth-gateway-codex-reasoning-replay.test.ts
 @@ -0,0 +1,156 @@

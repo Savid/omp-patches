@@ -28,10 +28,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 packages/ai/test/auth-lapsing-reset-drain.test.ts
 
 diff --git a/packages/ai/src/auth/select.ts b/packages/ai/src/auth/select.ts
-index cc913d1c5c..a931bcc30f 100644
+index 72f2245e..5afb384e 100644
 --- a/packages/ai/src/auth/select.ts
 +++ b/packages/ai/src/auth/select.ts
-@@ -41,6 +41,7 @@ import {
+@@ -42,6 +42,7 @@ import {
  import type { UsageService } from "./usage";
  import {
  	isUsageLimitReached,
@@ -39,7 +39,7 @@ index cc913d1c5c..a931bcc30f 100644
  	normalizeUsageFraction,
  	remainingUsageFraction,
  	scopedUsageLimits,
-@@ -297,9 +298,19 @@ export class CredentialSelector {
+@@ -298,9 +299,19 @@ export class CredentialSelector {
  				hasPriorityBoost: strategy.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
  				planPriority: 0,
  				secondaryUsed: normalizeUsageFraction(secondary),
@@ -61,7 +61,7 @@ index cc913d1c5c..a931bcc30f 100644
  				orderPos,
  			});
  		}
-@@ -555,10 +566,24 @@ export class CredentialSelector {
+@@ -556,10 +567,24 @@ export class CredentialSelector {
  				planPriority: planPriority(args.planGate, usage),
  				secondaryUsed: strategy ? normalizeUsageFraction(secondary) : 0,
  				secondaryRequiredDrain:
@@ -89,7 +89,7 @@ index cc913d1c5c..a931bcc30f 100644
  			});
  		}
 diff --git a/packages/ai/src/auth/usage-report.ts b/packages/ai/src/auth/usage-report.ts
-index 564e5e1501..31d809091b 100644
+index 564e5e15..31d80909 100644
 --- a/packages/ai/src/auth/usage-report.ts
 +++ b/packages/ai/src/auth/usage-report.ts
 @@ -259,6 +259,34 @@ export function remainingUsageFraction(
@@ -156,7 +156,7 @@ index 564e5e1501..31d809091b 100644
  	const remainingHours = Math.max(remainingMs, 60_000) / (60 * 60 * 1000);
 diff --git a/packages/ai/test/auth-lapsing-reset-drain.test.ts b/packages/ai/test/auth-lapsing-reset-drain.test.ts
 new file mode 100644
-index 0000000000..a2a6fbefe1
+index 00000000..a2a6fbef
 --- /dev/null
 +++ b/packages/ai/test/auth-lapsing-reset-drain.test.ts
 @@ -0,0 +1,87 @@
