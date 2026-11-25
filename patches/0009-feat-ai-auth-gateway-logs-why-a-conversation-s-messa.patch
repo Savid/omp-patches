@@ -1,0 +1,579 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Andrew Davis <1709934+Savid@users.noreply.github.com>
+Date: Thu, 26 Nov 2026 01:36:46 +1000
+Subject: [PATCH] feat(ai): auth gateway logs why a conversation's message
+ thread starts over
+
+A message-thread create uploads the whole conversation, and the cache
+entries its thread's continues wrote are not read by it: on a long agent
+conversation one create writes hundreds of thousands of tokens to the cache.
+Through the auth gateway, an Amp thread of about 470k tokens wrote close to
+500k tokens to the cache every one to two minutes for an hour, and nothing in
+the log said why its thread kept starting over.
+
+The gateway's request line now carries the request's session id, how it
+found its retained state (`client-key`, `history` with the messages appended
+since, or `new`), how many sessions it retains, and Amp's thread id when Amp
+sends one. The Anthropic provider logs each turn's thread decision at debug:
+a continue with what it appends; a create with its reason (no anchor, replay,
+expired, changed fields, or the message the history diverged at); or no
+thread, and why. It also logs why a finished turn was not stored as
+continuable, and the dropped-thinking lines carry the session id.
+
+Logging only: requests are unchanged.
+
+Upstream-Status: Pending
+---
+ packages/ai/src/auth-gateway/server.ts        |  29 ++++-
+ packages/ai/src/auth-gateway/session-state.ts |  36 +++++-
+ .../ai/src/providers/anthropic-threads.ts     |  86 ++++++++++++++
+ packages/ai/src/providers/anthropic.ts        |  44 +++++++-
+ ...anthropic-message-thread-decisions.test.ts | 105 ++++++++++++++++++
+ .../auth-gateway-session-state-found.test.ts  |  52 +++++++++
+ 6 files changed, 343 insertions(+), 9 deletions(-)
+ create mode 100644 packages/ai/test/anthropic-message-thread-decisions.test.ts
+ create mode 100644 packages/ai/test/auth-gateway-session-state-found.test.ts
+
+diff --git a/packages/ai/src/auth-gateway/server.ts b/packages/ai/src/auth-gateway/server.ts
+index 9d0ae4a7..49e7a6bb 100644
+--- a/packages/ai/src/auth-gateway/server.ts
++++ b/packages/ai/src/auth-gateway/server.ts
+@@ -75,7 +75,7 @@ import { handleSpeech } from "./routes/speech";
+ import { handleSystemOne } from "./routes/systemone";
+ import { handleTranscriptions } from "./routes/transcriptions";
+ import { handleVideoContent, handleVideoPoll, handleVideoSubmit } from "./routes/video";
+-import { AuthGatewaySessionStateStore } from "./session-state";
++import { type AuthGatewaySessionStateLease, AuthGatewaySessionStateStore } from "./session-state";
+ import type {
+ 	AuthGatewayServerHandle,
+ 	AuthGatewayFormatModule as FormatModule,
+@@ -159,6 +159,31 @@ function serializeTools(context: Context): string | undefined {
+ 	return context.tools && context.tools.length > 0 ? JSON.stringify(context.tools) : undefined;
+ }
+ 
++/**
++ * Where a request sits among the gateway's conversations, for the
++ * `auth-gateway request` log line: its session id (the client's key or the
++ * derived one), how it found its retained state, how many conversations the
++ * gateway holds, and Amp's thread id when Amp sent one. A request that finds no
++ * retained state starts its message thread over and uploads its whole history,
++ * so these fields are what tie a cache-write spike to its conversation.
++ */
++function sessionLogFields(
++	req: Request,
++	sessionId: string,
++	lease: AuthGatewaySessionStateLease,
++	sessionStates: AuthGatewaySessionStateStore,
++): Record<string, string | number> {
++	const fields: Record<string, string | number> = {
++		sessionId,
++		sessionState: lease.found,
++		retainedSessions: sessionStates.size,
++	};
++	if (lease.appended > 0) fields.sessionAppended = lease.appended;
++	const ampThreadId = req.headers.get("x-amp-thread-id");
++	if (ampThreadId) fields.ampThreadId = ampThreadId;
++	return fields;
++}
++
+ /**
+  * Fit a client-requested effort to the resolved model. Clients speak their own
+  * effort vocabulary: omp's `lowest-effort` reasoning-off sends `minimal` to a
+@@ -444,6 +469,7 @@ async function handleFormatEndpoint(
+ 		stream: parsed.stream,
+ 		peer,
+ 		...gatewayRequestLogFields(bootOpts, apiKey),
++		...sessionLogFields(req, sessionId, lease, sessionStates),
+ 	});
+ 
+ 	if (!parsed.stream) {
+@@ -665,6 +691,7 @@ async function handlePiNative(
+ 		stream: parsed.stream,
+ 		peer,
+ 		...gatewayRequestLogFields(bootOpts, apiKey),
++		...sessionLogFields(req, sessionId, lease, sessionStates),
+ 	});
+ 
+ 	if (!parsed.stream) {
+diff --git a/packages/ai/src/auth-gateway/session-state.ts b/packages/ai/src/auth-gateway/session-state.ts
+index 6d707088..75400719 100644
+--- a/packages/ai/src/auth-gateway/session-state.ts
++++ b/packages/ai/src/auth-gateway/session-state.ts
+@@ -51,6 +51,18 @@ type SessionDisposeReason = "evict" | "shutdown";
+ export interface AuthGatewaySessionStateLease {
+ 	/** The map to hand to `streamSimple` as `providerSessionState`. */
+ 	readonly states: Map<string, ProviderSessionState>;
++	/**
++	 * How the request found its entry, for the request log: by the client's
++	 * key, by a retained history this request extends, or not at all (a new
++	 * entry, so every lesson and any message thread starts over).
++	 */
++	readonly found: "client-key" | "history" | "new";
++	/**
++	 * For `history`, how many messages this request carries past the retained
++	 * one's history: 2 for the next turn of a tool loop, more when requests of
++	 * the conversation were missed. 0 otherwise.
++	 */
++	readonly appended: number;
+ 	/** Reset account-scoped records if an in-request auth retry switches accounts. */
+ 	updateAccount(account: string): void;
+ 	/** Give up this request's claim. Idempotent. */
+@@ -284,10 +296,16 @@ export class AuthGatewaySessionStateStore {
+ 	 * evicted.
+ 	 */
+ 	acquire(request: AuthGatewaySessionStateRequest): AuthGatewaySessionStateLease {
+-		const session = this.#claim(sessionKeys(request), request.account);
++		const { session, found, appended } = this.#claim(
++			sessionKeys(request),
++			request.account,
++			request.clientKey !== undefined,
++		);
+ 		let released = false;
+ 		return {
+ 			states: session.states,
++			found,
++			appended,
+ 			updateAccount: (account: string): void => {
+ 				if (session.account === account) return;
+ 				resetAccountScopedProviderSessionState(session.states);
+@@ -319,9 +337,13 @@ export class AuthGatewaySessionStateStore {
+ 	 * entry belongs to the request that just created it, and is not a candidate
+ 	 * for making room for itself.
+ 	 */
+-	#claim(keys: readonly string[], account: string): RetainedSession {
++	#claim(
++		keys: readonly string[],
++		account: string,
++		byClientKey: boolean,
++	): { session: RetainedSession; found: AuthGatewaySessionStateLease["found"]; appended: number } {
+ 		const key = keys[0] ?? "";
+-		for (const candidate of keys) {
++		for (const [index, candidate] of keys.entries()) {
+ 			const session = this.#sessions.get(candidate);
+ 			if (session === undefined) continue;
+ 			// Re-insert at the tail for recency, under this request's own key so
+@@ -336,12 +358,16 @@ export class AuthGatewaySessionStateStore {
+ 				resetAccountScopedProviderSessionState(session.states);
+ 				session.account = account;
+ 			}
+-			return session;
++			// Keys run from this request's whole history backwards, one message
++			// at a time, so a candidate's index is how many messages it lacks.
++			return byClientKey
++				? { session, found: "client-key", appended: 0 }
++				: { session, found: "history", appended: index };
+ 		}
+ 		const created: RetainedSession = { key, states: new Map(), account, leases: 1 };
+ 		this.#sessions.set(key, created);
+ 		this.#evict();
+-		return created;
++		return { session: created, found: "new", appended: 0 };
+ 	}
+ 
+ 	/**
+diff --git a/packages/ai/src/providers/anthropic-threads.ts b/packages/ai/src/providers/anthropic-threads.ts
+index 1f79e564..e4b3c616 100644
+--- a/packages/ai/src/providers/anthropic-threads.ts
++++ b/packages/ai/src/providers/anthropic-threads.ts
+@@ -122,6 +122,38 @@ export interface AnthropicThreadRequest {
+ 	body: MessageCreateParamsStreaming;
+ }
+ 
++/**
++ * Why {@link AnthropicThreadTurn.plan} shaped a request as it did, for the log.
++ * A create uploads the whole conversation, and the cache entries a thread's
++ * continues wrote are not read by it, so its reason is what explains a
++ * cache-write spike on a long conversation.
++ */
++export type AnthropicThreadDecision =
++	| {
++			kind: "none";
++			/** This call dropped its thread, the session's chain is disabled, or the body cannot be threaded. */
++			reason: "unthreaded" | "disabled" | "unthreadable";
++	  }
++	| { kind: "continue"; messages: number; appended: number; anchorAgeMs: number }
++	| {
++			kind: "create";
++			/**
++			 * `no-anchor`: no stored response to continue (a new session, or the last
++			 * turn was not stored or did not settle); `replay`: the server refused
++			 * this call's continue; `expired`: the stored response is past the reuse
++			 * window; `fields-changed`: a fixed field differs; `diverged`: the
++			 * messages do not extend the held conversation.
++			 */
++			reason: "no-anchor" | "replay" | "expired" | "fields-changed" | "diverged";
++			messages: number;
++			anchorAgeMs?: number;
++			/** Fixed fields that differ from the anchor's, for `fields-changed`. */
++			fields?: string[];
++			/** Messages the server holds, and the first one this request does not repeat, for `diverged`. */
++			held?: number;
++			divergedAt?: number;
++	  };
++
+ /**
+  * What the provider does with a request the server refused for a thread
+  * reason: `replay` resends it as a create, `unthreaded` resends it without
+@@ -201,6 +233,10 @@ export class AnthropicThreadTurn {
+ 				request: AnthropicThreadRequest;
+ 		  }
+ 		| undefined;
++	/** Why the latest {@link plan} shaped its request so, until {@link takeDecision} reports it. */
++	#decision: AnthropicThreadDecision | undefined;
++	/** The decision last reported, so a retry rung that plans the same way logs nothing new. */
++	#reported: string | undefined;
+ 
+ 	constructor(chain: AnthropicThreadChain, options: { resendSystemAndTools: boolean }) {
+ 		this.#chain = chain;
+@@ -219,6 +255,10 @@ export class AnthropicThreadTurn {
+ 	): AnthropicThreadRequest | undefined {
+ 		if (this.#unthreaded || this.#chain.disabled || !isThreadable(params)) {
+ 			this.#planned = undefined;
++			this.#decision = {
++				kind: "none",
++				reason: this.#unthreaded ? "unthreaded" : this.#chain.disabled ? "disabled" : "unthreadable",
++			};
+ 			return undefined;
+ 		}
+ 		const planned = this.#planned;
+@@ -234,6 +274,12 @@ export class AnthropicThreadTurn {
+ 			Bun.deepEquals(anchor.fingerprint, fingerprint) &&
+ 			extendsConversation(digests, anchor.digests)
+ 		) {
++			this.#decision = {
++				kind: "continue",
++				messages: digests.length,
++				appended: digests.length - anchor.digests.length,
++				anchorAgeMs: now - anchor.storedAt,
++			};
+ 			this.#claimed = anchor;
+ 			if (this.#chain.anchor === anchor) this.#chain.anchor = undefined;
+ 			const body: MessageCreateParamsStreaming = {
+@@ -248,11 +294,51 @@ export class AnthropicThreadTurn {
+ 			request = { kind: "continue", body };
+ 		} else {
+ 			request = { kind: "create", body: { ...params, thread: { type: "create" } } };
++			this.#decision = this.#createDecision(anchor, fingerprint, digests, now);
+ 		}
+ 		this.#planned = { params, betaHeader, fingerprint, digests, request };
+ 		return request;
+ 	}
+ 
++	/**
++	 * The latest {@link plan}'s decision, once: `undefined` when it planned as the
++	 * last reported one did, so a retry rung that resends the same request, or
++	 * the same lack of thread, logs nothing new.
++	 */
++	takeDecision(): AnthropicThreadDecision | undefined {
++		const decision = this.#decision;
++		if (!decision) return undefined;
++		const shape = JSON.stringify(decision);
++		if (shape === this.#reported) return undefined;
++		this.#reported = shape;
++		return decision;
++	}
++
++	#createDecision(
++		anchor: AnthropicThreadAnchor | undefined,
++		fingerprint: ThreadFingerprint,
++		digests: readonly string[],
++		now: number,
++	): AnthropicThreadDecision {
++		const messages = digests.length;
++		if (this.#forceCreate) return { kind: "create", reason: "replay", messages };
++		if (!anchor) return { kind: "create", reason: "no-anchor", messages };
++		const anchorAgeMs = now - anchor.storedAt;
++		if (anchorAgeMs >= THREAD_REUSE_WINDOW_MS) return { kind: "create", reason: "expired", messages, anchorAgeMs };
++		if (!Bun.deepEquals(anchor.fingerprint, fingerprint)) {
++			const fields = (Object.keys(fingerprint) as Array<keyof ThreadFingerprint>).filter(
++				field => !Bun.deepEquals(anchor.fingerprint[field], fingerprint[field]),
++			);
++			return { kind: "create", reason: "fields-changed", messages, anchorAgeMs, fields };
++		}
++		const held = anchor.digests.length;
++		let divergedAt = 0;
++		while (divergedAt < held && divergedAt < messages && digests[divergedAt] === anchor.digests[divergedAt]) {
++			divergedAt++;
++		}
++		return { kind: "create", reason: "diverged", messages, anchorAgeMs, held, divergedAt };
++	}
++
+ 	/**
+ 	 * Handle a pre-stream failure of the planned request. Returns how to resend
+ 	 * it when the server refused it for a thread reason; `undefined` leaves the
+diff --git a/packages/ai/src/providers/anthropic.ts b/packages/ai/src/providers/anthropic.ts
+index 6e2c0595..381cd128 100644
+--- a/packages/ai/src/providers/anthropic.ts
++++ b/packages/ai/src/providers/anthropic.ts
+@@ -1821,14 +1821,21 @@ function reportedDropKey(params: MessageCreateParamsStreaming, path: string | un
+  * every path at debug. One prefix change can drop hundreds of blocks in a
+  * single request, which would otherwise flood the log one line per block.
+  */
+-export function logDroppedThinking(provider: string, model: string, paths: Array<string | undefined>): void {
++export function logDroppedThinking(
++	provider: string,
++	model: string,
++	paths: Array<string | undefined>,
++	sessionId?: string,
++): void {
+ 	if (paths.length === 0) return;
++	const session = sessionId === undefined ? {} : { sessionId };
+ 	logger.warn(`${provider}: dropped thinking block after conversation prefix changed`, {
+ 		model,
+ 		count: paths.length,
+ 		path: paths[0],
++		...session,
+ 	});
+-	if (paths.length > 1) logger.debug(`${provider}: dropped thinking block paths`, { model, paths });
++	if (paths.length > 1) logger.debug(`${provider}: dropped thinking block paths`, { model, paths, ...session });
+ }
+ 
+ /**
+@@ -1846,6 +1853,7 @@ function applyReportedInputTransformations(
+ 	seen: Set<string>,
+ 	params: MessageCreateParamsStreaming,
+ 	state: AnthropicProviderSessionState | undefined,
++	sessionId: string | undefined,
+ 	replace = false,
+ ): void {
+ 	if (value === undefined || value === null) return;
+@@ -1876,11 +1884,12 @@ function applyReportedInputTransformations(
+ 		}
+ 		dropped.push(transformation.path);
+ 	}
+-	logDroppedThinking("anthropic", output.model, dropped);
++	logDroppedThinking("anthropic", output.model, dropped, sessionId);
+ 	if (repeated > 0) {
+ 		logger.debug("anthropic: API re-dropped previously reported thinking blocks", {
+ 			model: output.model,
+ 			count: repeated,
++			...(sessionId === undefined ? {} : { sessionId }),
+ 		});
+ 	}
+ }
+@@ -2772,6 +2781,14 @@ const streamAnthropicOnce = (
+ 				// `params` stays the full body every retry rung and the refusal credit
+ 				// read; only the wire sees the thread shape, with its beta.
+ 				const threadRequest = threadTurn?.plan(params, sentBetaHeader);
++				const threadDecision = threadTurn?.takeDecision();
++				if (threadDecision) {
++					logger.debug("anthropic: message thread", {
++						sessionId: threadSessionId,
++						model: model.id,
++						...threadDecision,
++					});
++				}
+ 				const wireParams = threadRequest?.body ?? params;
+ 				if (threadTurn && rawRequestDump) rawRequestDump.body = wireParams;
+ 				const requestHeaders = threadRequest
+@@ -2956,6 +2973,7 @@ const streamAnthropicOnce = (
+ 								seenInputTransformations,
+ 								params,
+ 								providerSessionState,
++								options?.sessionId,
+ 							);
+ 							const startUsage = startMessage?.usage;
+ 							if (startUsage) {
+@@ -3271,6 +3289,7 @@ const streamAnthropicOnce = (
+ 								seenInputTransformations,
+ 								params,
+ 								providerSessionState,
++								options?.sessionId,
+ 								true,
+ 							);
+ 							const rawStopReason = delta?.stop_reason;
+@@ -3888,6 +3907,25 @@ const streamAnthropicOnce = (
+ 					continuable && messageId
+ 						? replayResponse?.(retained === output.content ? output : { ...output, content: retained })
+ 						: undefined;
++				if (!messageId || !message) {
++					// The next request of this session will create a new thread and
++					// upload the whole conversation; say why this turn ended its thread.
++					logger.debug("anthropic: message thread not stored", {
++						sessionId: threadSessionId,
++						model: model.id,
++						reason: !messageId
++							? "no-response-id"
++							: output.stopReason !== "stop" && output.stopReason !== "toolUse"
++								? `stop-${output.stopReason}`
++								: output.stopDetails?.type === "pause_turn"
++									? "pause-turn"
++									: output.model !== sourceModel.id
++										? "other-model"
++										: retained.some(block => block.type === "fallback")
++											? "fallback"
++											: "no-replay",
++					});
++				}
+ 				threadTurn.settle(messageId && message ? { messageId, message } : undefined);
+ 			}
+ 			output.duration = performance.now() - startTime;
+diff --git a/packages/ai/test/anthropic-message-thread-decisions.test.ts b/packages/ai/test/anthropic-message-thread-decisions.test.ts
+new file mode 100644
+index 00000000..fd4afaf9
+--- /dev/null
++++ b/packages/ai/test/anthropic-message-thread-decisions.test.ts
+@@ -0,0 +1,105 @@
++/**
++ * Why a message-thread turn continues or starts over. A create uploads the
++ * whole conversation and cannot read the cache its thread's continues wrote,
++ * so the provider logs each turn's decision with its reason: the evidence that
++ * ties a cache-write spike on a long conversation to its cause.
++ */
++import { describe, expect, it } from "bun:test";
++import {
++	type AnthropicThreadChains,
++	AnthropicThreadTurn,
++	anthropicThreadChain,
++} from "@oh-my-pi/pi-ai/providers/anthropic-threads";
++import type { MessageCreateParamsStreaming, MessageParam } from "@oh-my-pi/pi-ai/providers/anthropic-wire";
++
++const T0 = 1_800_000_000_000;
++
++function body(messages: MessageParam[], system = "Be brief."): MessageCreateParamsStreaming {
++	return { model: "claude-sonnet-4-6", max_tokens: 1024, stream: true, system, messages };
++}
++
++const user = (text: string): MessageParam => ({ role: "user", content: text });
++const reply = (text: string): MessageParam => ({ role: "assistant", content: [{ type: "text", text }] });
++
++/** Plan one turn of the session at `now`, report its decision, and store `stored` as its response. */
++function turn(chains: AnthropicThreadChains, params: MessageCreateParamsStreaming, now: number, stored?: MessageParam) {
++	const threadTurn = new AnthropicThreadTurn(anthropicThreadChain(chains, "session"), { resendSystemAndTools: false });
++	threadTurn.plan(params, "", now);
++	const decision = threadTurn.takeDecision();
++	threadTurn.settle(stored && { messageId: `msg_${now}`, message: stored }, now);
++	return decision;
++}
++
++/** A session whose first turn stored `reply("b")` at T0. */
++function opened(): AnthropicThreadChains {
++	const chains: AnthropicThreadChains = new Map();
++	turn(chains, body([user("a")]), T0, reply("b"));
++	return chains;
++}
++
++describe("anthropic message thread decisions", () => {
++	it("reports a create with nothing to continue, then a continue with what it appends", () => {
++		const chains: AnthropicThreadChains = new Map();
++		expect(turn(chains, body([user("a")]), T0, reply("b"))).toEqual({
++			kind: "create",
++			reason: "no-anchor",
++			messages: 1,
++		});
++		expect(turn(chains, body([user("a"), reply("b"), user("c")]), T0 + 1_000)).toEqual({
++			kind: "continue",
++			messages: 3,
++			appended: 1,
++			anchorAgeMs: 1_000,
++		});
++	});
++
++	it("reports a turn that was not stored as leaving its successor nothing to continue", () => {
++		const chains: AnthropicThreadChains = new Map();
++		turn(chains, body([user("a")]), T0);
++		expect(turn(chains, body([user("a"), reply("b"), user("c")]), T0 + 1_000)).toMatchObject({
++			kind: "create",
++			reason: "no-anchor",
++		});
++	});
++
++	it("names why a turn starts over: expired, changed fields, or diverged history", () => {
++		expect(turn(opened(), body([user("a"), reply("b"), user("c")]), T0 + 300_000)).toEqual({
++			kind: "create",
++			reason: "expired",
++			messages: 3,
++			anchorAgeMs: 300_000,
++		});
++		expect(turn(opened(), body([user("a"), reply("b"), user("c")], "Be thorough."), T0 + 1_000)).toEqual({
++			kind: "create",
++			reason: "fields-changed",
++			messages: 3,
++			anchorAgeMs: 1_000,
++			fields: ["system"],
++		});
++		expect(turn(opened(), body([user("a"), reply("edited"), user("c")]), T0 + 1_000)).toEqual({
++			kind: "create",
++			reason: "diverged",
++			messages: 3,
++			anchorAgeMs: 1_000,
++			held: 2,
++			divergedAt: 1,
++		});
++	});
++
++	it("reports a body a thread cannot hold, and each decision only once across retry rungs", () => {
++		const chains: AnthropicThreadChains = new Map();
++		const threadTurn = new AnthropicThreadTurn(anthropicThreadChain(chains, "session"), {
++			resendSystemAndTools: false,
++		});
++		const params = body([user("a")]);
++		threadTurn.plan(params, "", T0);
++		expect(threadTurn.takeDecision()).toMatchObject({ kind: "create" });
++		// A transient retry resends the same request: nothing new to report.
++		threadTurn.plan(params, "", T0);
++		expect(threadTurn.takeDecision()).toBeUndefined();
++
++		const compacting: MessageCreateParamsStreaming = { ...body([user("a")]), compaction: { type: "summarize" } };
++		threadTurn.plan(compacting, "", T0);
++		expect(threadTurn.takeDecision()).toEqual({ kind: "none", reason: "unthreadable" });
++	});
++});
+diff --git a/packages/ai/test/auth-gateway-session-state-found.test.ts b/packages/ai/test/auth-gateway-session-state-found.test.ts
+new file mode 100644
+index 00000000..947757c9
+--- /dev/null
++++ b/packages/ai/test/auth-gateway-session-state-found.test.ts
+@@ -0,0 +1,52 @@
++/**
++ * How a request found its retained session state, which the gateway logs on
++ * every request: a request that finds none starts its message thread over and
++ * uploads its whole conversation, so this is what explains such an upload.
++ */
++import { describe, expect, it } from "bun:test";
++import { AuthGatewaySessionStateStore } from "@oh-my-pi/pi-ai/auth-gateway";
++import type { AuthGatewaySessionStateRequest } from "@oh-my-pi/pi-ai/auth-gateway";
++import type { Message } from "@oh-my-pi/pi-ai/types";
++import { buildModel } from "@oh-my-pi/pi-catalog/build";
++
++const MODEL = buildModel({
++	id: "claude-sonnet-4-6",
++	name: "Claude Sonnet 4.6",
++	api: "anthropic-messages",
++	provider: "anthropic",
++	baseUrl: "https://api.anthropic.com",
++	reasoning: false,
++	input: ["text"],
++	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
++	contextWindow: 200_000,
++	maxTokens: 8_192,
++});
++
++function request(texts: string[], clientKey?: string): AuthGatewaySessionStateRequest {
++	const messages: Message[] = texts.map((content, index) => ({ role: "user", content, timestamp: index }));
++	return { clientKey, model: MODEL, context: { messages }, account: "credential:1" };
++}
++
++/** Acquire and release at once, returning how the request found its state. */
++function place(store: AuthGatewaySessionStateStore, req: AuthGatewaySessionStateRequest) {
++	const lease = store.acquire(req);
++	lease.release();
++	return { found: lease.found, appended: lease.appended };
++}
++
++describe("auth-gateway session state lookup", () => {
++	it("finds a keyless conversation by the history it extends, and says how far it moved on", () => {
++		const store = new AuthGatewaySessionStateStore();
++		expect(place(store, request(["a"]))).toEqual({ found: "new", appended: 0 });
++		expect(place(store, request(["a", "b", "c"]))).toEqual({ found: "history", appended: 2 });
++		// A branch that shares the opening finds nothing: the conversation it shares
++		// it with has moved on to a longer history.
++		expect(place(store, request(["a", "x"]))).toEqual({ found: "new", appended: 0 });
++	});
++
++	it("finds a conversation by the client's key", () => {
++		const store = new AuthGatewaySessionStateStore();
++		expect(place(store, request(["a"], "thread-1"))).toEqual({ found: "new", appended: 0 });
++		expect(place(store, request(["a", "b"], "thread-1"))).toEqual({ found: "client-key", appended: 0 });
++	});
++});
