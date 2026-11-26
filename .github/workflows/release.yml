@@ -15,6 +15,7 @@ permissions:
   contents: write
   packages: write
   issues: write
+  id-token: write # keyless cosign signing (Sigstore, GitHub OIDC)
 
 concurrency:
   group: release
@@ -79,6 +80,10 @@ jobs:
         run: scripts/test.sh
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
         if: steps.plan.outputs.release == 'true'
+      - uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+        if: steps.plan.outputs.release == 'true'
+        with:
+          cosign-release: v3.1.6
       - name: Build
         if: steps.plan.outputs.release == 'true'
         run: scripts/build.sh "$IMAGE:${{ steps.plan.outputs.tag }}"
@@ -107,13 +112,17 @@ jobs:
           # (see gateway/Dockerfile).
           scripts/build.sh "$IMAGE:${TAG#v}" --platform linux/amd64,linux/arm64 \
             --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" --push --quiet
+          # Sign the multi-arch index keylessly: the certificate names this
+          # workflow on master, which is what deployments verify.
+          digest=$(docker buildx imagetools inspect "$IMAGE:${TAG#v}" --format '{{json .Manifest.Digest}}' | jq -r .)
+          cosign sign --yes "$IMAGE@$digest"
           docker logout ghcr.io
           {
             echo "[omp $VERSION](https://github.com/can1357/oh-my-pi/releases/tag/v$VERSION) with:"
             echo
             python3 scripts/readme.py --notes
             echo
-            echo "Image: \`$IMAGE:${TAG#v}\`"
+            echo "Image: \`$IMAGE:${TAG#v}\` (\`$digest\`, signed with cosign)"
           } >notes.md
           gh release create "$TAG" --title "$TAG" --notes-file notes.md
           for issue in $(gh issue list --state open --search "\"Patches fail on omp\" in:title" --json number,title \

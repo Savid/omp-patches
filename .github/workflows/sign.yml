@@ -1,0 +1,45 @@
+name: Sign
+
+# Sign an already published release's image (one released before signing
+# existed). Release signs every new image itself.
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v19.2.1-r1
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write # keyless cosign signing (Sigstore, GitHub OIDC)
+
+env:
+  IMAGE: ghcr.io/savid/omp
+
+jobs:
+  sign:
+    if: github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+        with:
+          cosign-release: v3.1.6
+      - name: Sign
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          case "$TAG" in
+            v[0-9]*-r[0-9]*) ;;
+            *) echo "not a release tag: $TAG" >&2; exit 1 ;;
+          esac
+          case "$TAG" in *[!A-Za-z0-9.-]*) echo "not a release tag: $TAG" >&2; exit 1 ;; esac
+          # Only images this repo released.
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json tagName >/dev/null
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          digest=$(docker buildx imagetools inspect "$IMAGE:${TAG#v}" --format '{{json .Manifest.Digest}}' | jq -r .)
+          cosign sign --yes "$IMAGE@$digest"
+          docker logout ghcr.io
+          echo "signed $IMAGE:${TAG#v} ($digest)"
