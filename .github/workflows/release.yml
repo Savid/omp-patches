@@ -77,6 +77,8 @@ jobs:
       - name: Test
         if: steps.plan.outputs.release == 'true'
         run: scripts/test.sh
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        if: steps.plan.outputs.release == 'true'
       - name: Build
         if: steps.plan.outputs.release == 'true'
         run: scripts/build.sh "$IMAGE:${{ steps.plan.outputs.tag }}"
@@ -101,10 +103,10 @@ jobs:
         run: |
           git tag "$TAG" && git push origin "$TAG"
           printf '%s' "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          for tag in "${TAG#v}" "$VERSION" latest; do
-            docker tag "$IMAGE:$TAG" "$IMAGE:$tag"
-            docker push --quiet "$IMAGE:$tag"
-          done
+          # amd64 and arm64 in one image; the arm64 half is built without emulation
+          # (see gateway/Dockerfile).
+          scripts/build.sh "$IMAGE:${TAG#v}" --platform linux/amd64,linux/arm64 \
+            --tag "$IMAGE:$VERSION" --tag "$IMAGE:latest" --push --quiet
           docker logout ghcr.io
           {
             echo "[omp $VERSION](https://github.com/can1357/oh-my-pi/releases/tag/v$VERSION) with:"

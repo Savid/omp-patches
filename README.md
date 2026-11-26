@@ -5,7 +5,7 @@
 ![A new omp release, with the patch series applied in order, checked and tested, becomes the ghcr.io/savid/omp image](docs/series.svg)
 
 Every hour CI looks for a new omp release, applies the series to its tag, checks and tests every package it
-touches, and publishes `ghcr.io/savid/omp:<omp version>-r<n>` (also `:<omp version>` and `:latest`). The image is
+touches, and publishes `ghcr.io/savid/omp:<omp version>-r<n>` (also `:<omp version>` and `:latest`) for linux/amd64 and linux/arm64. The image is
 the release as published, with only the patched files swapped in.
 
 ## Patches

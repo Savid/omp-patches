@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Build the gateway image from the patched clone in ./upstream.
 #
-#   scripts/build.sh [image]    # default image: omp-gateway:<version>
+#   scripts/build.sh [image] [buildx args...]    # default image: omp-gateway:<version>
+#
+#   scripts/build.sh omp-gateway:dev                     # this host's CPU, into the local docker
+#   scripts/build.sh ghcr.io/savid/omp:x --platform linux/amd64,linux/arm64 --push
+#
+# With no buildx args the image is loaded into the local docker (--load).
 #
 # The image is the omp release pinned in gateway/package.json, as published,
 # with every file the series adds or changes laid over it. build/ holds what
@@ -54,6 +59,11 @@ while IFS=$'\t' read -r status file; do
 	count=$((count + 1))
 done < <(git -C "$dir" diff --no-renames --name-status "v$version" HEAD -- 'packages/*/src/**')
 
+buildx_args=("${@:2}")
+if [ ${#buildx_args[@]} -eq 0 ]; then
+	buildx_args=(--load)
+fi
+
 echo "laying $count patched files over omp $version"
-docker build --file "$root/gateway/Dockerfile" --tag "$image" \
-	--label "org.opencontainers.image.version=$version" "$root"
+docker buildx build --file "$root/gateway/Dockerfile" --tag "$image" \
+	--label "org.opencontainers.image.version=$version" "${buildx_args[@]}" "$root"
