@@ -8,6 +8,13 @@ Every hour CI looks for a new omp release, applies the series to its tag, checks
 touches, and publishes `ghcr.io/savid/omp:<omp version>-r<n>` (also `:<omp version>` and `:latest`) for linux/amd64 and linux/arm64. The image is
 the release as published, with only the patched files swapped in.
 
+Every image is signed keylessly with cosign by the release workflow. Verify before running one:
+
+```sh
+cosign verify ghcr.io/savid/omp:<tag> --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  --certificate-identity-regexp '^https://github\.com/Savid/omp-patches/\.github/workflows/(release|sign)\.yml@refs/heads/master$'
+```
+
 ## Patches
 
 Each patch's header says what it changes and why. Upstream status is `Pending` (not sent), `Submitted [where]`,
