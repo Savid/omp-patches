@@ -55,7 +55,7 @@ index 08a7beae..f11fd2cc 100644
   *   conversation ids are conversation-scoped. Neither depends on the account.
   * - **GitLab Duo** — the active workflow is account-bound, but it is a live
 diff --git a/packages/ai/src/providers/openai-codex-responses.ts b/packages/ai/src/providers/openai-codex-responses.ts
-index 8542ab71..5cde25d7 100644
+index cb691b3e..a8d7c446 100644
 --- a/packages/ai/src/providers/openai-codex-responses.ts
 +++ b/packages/ai/src/providers/openai-codex-responses.ts
 @@ -98,6 +98,11 @@ import {
@@ -87,7 +87,7 @@ index 8542ab71..5cde25d7 100644
  }
  
  /** Request classification encoded in Codex turn metadata. */
-@@ -1289,6 +1297,7 @@ function createCodexRequestContext(
+@@ -1304,6 +1312,7 @@ function createCodexRequestContext(
  	};
  
  	const providerSessionState = getCodexProviderSessionState(options?.providerSessionState);
@@ -95,7 +95,7 @@ index 8542ab71..5cde25d7 100644
  	const isolatedTransportState =
  		contextOptions.isolateCompactionTransport && options?.codexCompaction
  			? createCodexProviderSessionState()
-@@ -1533,11 +1542,25 @@ async function openInitialCodexEventStream(
+@@ -1548,11 +1557,25 @@ async function openInitialCodexEventStream(
  	} else if (websocketState) {
  		releaseIdleCodexWebSocket(websocketState);
  	}
@@ -126,7 +126,7 @@ index 8542ab71..5cde25d7 100644
  	}
  }
  
-@@ -2708,6 +2731,9 @@ class CodexStreamProcessor {
+@@ -2723,6 +2746,9 @@ class CodexStreamProcessor {
  		if (await this.#tryDropRejectedAccessPrograms(error)) {
  			return true;
  		}
@@ -136,7 +136,7 @@ index 8542ab71..5cde25d7 100644
  		if (await this.#tryRecoverWhitespaceToolCallLoop(error)) {
  			return true;
  		}
-@@ -2886,6 +2912,33 @@ class CodexStreamProcessor {
+@@ -2901,6 +2927,33 @@ class CodexStreamProcessor {
  		) {
  			return false;
  		}
@@ -170,7 +170,7 @@ index 8542ab71..5cde25d7 100644
  		this.#closeOpenBlocksForReplay();
  		const websocketState = this.requestContext.websocketState;
  		if (websocketState) resetCodexWebSocketAppendState(websocketState);
-@@ -2898,7 +2951,6 @@ class CodexStreamProcessor {
+@@ -2913,7 +2966,6 @@ class CodexStreamProcessor {
  		} else {
  			await this.#reopenSseStream(websocketState);
  		}
@@ -178,7 +178,7 @@ index 8542ab71..5cde25d7 100644
  	}
  
  	/**
-@@ -4472,7 +4524,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
+@@ -4488,7 +4540,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
  		msgIndex += 1;
  	}
  

@@ -28,10 +28,10 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 packages/ai/test/auth-lapsing-reset-drain.test.ts
 
 diff --git a/packages/ai/src/auth/select.ts b/packages/ai/src/auth/select.ts
-index 72f2245e..5afb384e 100644
+index c18996cf..df4e7e19 100644
 --- a/packages/ai/src/auth/select.ts
 +++ b/packages/ai/src/auth/select.ts
-@@ -42,6 +42,7 @@ import {
+@@ -43,6 +43,7 @@ import {
  import type { UsageService } from "./usage";
  import {
  	isUsageLimitReached,
@@ -39,7 +39,7 @@ index 72f2245e..5afb384e 100644
  	normalizeUsageFraction,
  	remainingUsageFraction,
  	scopedUsageLimits,
-@@ -298,9 +299,19 @@ export class CredentialSelector {
+@@ -315,9 +316,19 @@ export class CredentialSelector {
  				hasPriorityBoost: strategy.hasPriorityBoost?.(primary, primaryUncapped, args.rankingContext) ?? false,
  				planPriority: 0,
  				secondaryUsed: normalizeUsageFraction(secondary),
@@ -61,8 +61,8 @@ index 72f2245e..5afb384e 100644
  				orderPos,
  			});
  		}
-@@ -556,10 +567,24 @@ export class CredentialSelector {
- 				planPriority: planPriority(args.planGate, usage),
+@@ -646,10 +657,24 @@ export class CredentialSelector {
+ 				serviceTierOffered,
  				secondaryUsed: strategy ? normalizeUsageFraction(secondary) : 0,
  				secondaryRequiredDrain:
 -					strategy === undefined ? 0 : windowRequiredDrain(secondary, nowMs, strategy.windowDefaults.secondaryMs),

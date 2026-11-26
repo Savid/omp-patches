@@ -35,7 +35,7 @@ Upstream-Status: Pending
  create mode 100644 packages/ai/test/auth-gateway-session-state-found.test.ts
 
 diff --git a/packages/ai/src/auth-gateway/server.ts b/packages/ai/src/auth-gateway/server.ts
-index 9d0ae4a7..49e7a6bb 100644
+index 1a25bc3b..4f8e9a83 100644
 --- a/packages/ai/src/auth-gateway/server.ts
 +++ b/packages/ai/src/auth-gateway/server.ts
 @@ -75,7 +75,7 @@ import { handleSpeech } from "./routes/speech";
@@ -79,7 +79,7 @@ index 9d0ae4a7..49e7a6bb 100644
  /**
   * Fit a client-requested effort to the resolved model. Clients speak their own
   * effort vocabulary: omp's `lowest-effort` reasoning-off sends `minimal` to a
-@@ -444,6 +469,7 @@ async function handleFormatEndpoint(
+@@ -451,6 +476,7 @@ async function handleFormatEndpoint(
  		stream: parsed.stream,
  		peer,
  		...gatewayRequestLogFields(bootOpts, apiKey),
@@ -87,7 +87,7 @@ index 9d0ae4a7..49e7a6bb 100644
  	});
  
  	if (!parsed.stream) {
-@@ -665,6 +691,7 @@ async function handlePiNative(
+@@ -679,6 +705,7 @@ async function handlePiNative(
  		stream: parsed.stream,
  		peer,
  		...gatewayRequestLogFields(bootOpts, apiKey),

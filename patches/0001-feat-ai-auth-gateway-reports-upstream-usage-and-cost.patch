@@ -715,7 +715,7 @@ index 00000000..ab978a4f
 +	});
 +});
 diff --git a/packages/catalog/src/types.ts b/packages/catalog/src/types.ts
-index 148e8ba5..bf08a1ce 100644
+index 9ba94657..2e609056 100644
 --- a/packages/catalog/src/types.ts
 +++ b/packages/catalog/src/types.ts
 @@ -274,6 +274,21 @@ export interface Usage {
@@ -755,7 +755,7 @@ index 6c25684a..9d93117f 100644
  		"cttl?": JSON_OBJECT,
  		"server?": JSON_OBJECT,
 diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
-index 37e163cf..dd5befbe 100644
+index 9b6fc39d..044cb7ae 100644
 --- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
 +++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.generated.ts
 @@ -85,6 +85,9 @@ export interface Usage {
@@ -769,7 +769,7 @@ index 37e163cf..dd5befbe 100644
  	cttl?: Record<string, unknown>;
  	server?: Record<string, unknown>;
 diff --git a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
-index 6eea90de..407b7831 100644
+index c7fab7cc..335dda8d 100644
 --- a/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
 +++ b/packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json
 @@ -1172,6 +1172,15 @@
@@ -789,4 +789,4 @@ index 6eea90de..407b7831 100644
  					"type": "object",
  					"properties": {},
 
-base-commit: 5c5ecb16fa4903c09a57a84983e482d9c9c2232e
+base-commit: b55cd1bb664d8ab46ddc77f2a34eb47555dbf1ac
